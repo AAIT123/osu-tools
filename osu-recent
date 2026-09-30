@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+osu-recent — your most recent local play on the current map: real
+judgements, accuracy, combo, mods and real pp (via rosu-pp), plus what the
+same accuracy would be worth at full combo. Works for all four modes,
+including converts (e.g. a std map you played as taiko). Entirely offline:
+reads osu!'s own local replay files, no tosu, no API key.
+
+Looks in both places stable keeps replays:
+    <osu!>/Replays   replays you exported (F2 on the results screen)
+    <osu!>/Data/r    the replay behind every passed local score, saved
+                     automatically as <beatmap md5>-<time>.osr. The .osg
+                     files next to them are spectator data and are ignored.
+                     Failed attempts are never saved here.
+
+Accuracy formulas are the ones from osu.ppy.sh/wiki/Accuracy. pp is
+computed from your exact hit counts, not reconstructed from a percentage.
+
+Install:
+    pip install rosu-pp-py
+
+Usage:
+    osu-recent            # your latest play on the current map
+    osu-recent --list     # your 10 most recent plays on it, newest first
+"""
+
+import datetime
+import hashlib
+import os
+import re
+import struct
+import sys
+
+OSU_SONGS = os.environ.get(
+    "OSU_SONGS", os.path.expanduser("~/.local/share/osu-wine/osu!/Songs")
+)
+OSU_ROOT = os.path.dirname(OSU_SONGS.rstrip("/"))
+REPLAY_DIRS = [
+    ("Replays", os.path.join(OSU_ROOT, "Replays")),
+    ("Data/r", os.path.join(OSU_ROOT, "Data", "r")),
+]
+
+CURRENT_STATE = os.environ.get(
+    "OSU_CURRENT_STATE", os.path.expanduser("~/.cache/osu-current-map")
+)
+
+MODE_NAMES = {0: "osu!", 1: "osu!taiko", 2: "osu!catch", 3: "osu!mania"}
+
+MOD_NAMES = [
+    (1, "NF"), (2, "EZ"), (4, "TD"), (8, "HD"), (16, "HR"), (32, "SD"),
+    (64, "DT"), (128, "RX"), (256, "HT"), (512, "NC"), (1024, "FL"),
+    (2048, "AT"), (4096, "SO"), (8192, "AP"), (16384, "PF"),
+    (32768, "4K"), (65536, "5K"), (131072, "6K"), (262144, "7K"),
+    (524288, "8K"), (1048576, "FI"), (2097152, "RD"), (4194304, "CN"),
+    (8388608, "TP"), (16777216, "9K"), (33554432, "CO"), (67108864, "1K"),
+    (134217728, "3K"), (268435456, "2K"), (536870912, "SV2"), (1073741824, "MR"),
+]
+SCORE_V2 = 536870912
+
+
+def mods_to_string(mods: int) -> str:
+    if mods == 0:
+        return "NM"
+    names = [name for bit, name in MOD_NAMES if mods & bit]
+    # NC always comes with DT, PF always with SD; show only the stronger one.
+    if mods & 512 and "DT" in names:
+        names.remove("DT")
+    if mods & 16384 and "SD" in names:
+        names.remove("SD")
+    return "".join(names) if names else f"({mods})"
+
+
+class Reader:
+    def __init__(self, data: bytes):
+        self.buf = data
+        self.pos = 0
+
+    def _read(self, n):
+        b = self.buf[self.pos:self.pos + n]
+        if len(b) != n:
+            raise EOFError(f"expected {n} bytes at offset {self.pos}")
+        self.pos += n
+        return b
+
+    def byte(self):
+        return self._read(1)[0]
+
+    def short(self):
+        return struct.unpack("<H", self._read(2))[0]
+
+    def int(self):
+        return struct.unpack("<i", self._read(4))[0]
+
+    def long(self):
+        return struct.unpack("<q", self._read(8))[0]
+
+    def uleb128(self):
+        result, shift = 0, 0
+        while True:
+            b = self.byte()
+            result |= (b & 0x7F) << shift
+            if (b & 0x80) == 0:
+                break
+            shift += 7
+        return result
+
+    def string(self):
+        marker = self.byte()
+        if marker == 0x00:
+            return None
+        if marker != 0x0B:
+            raise ValueError(f"bad string marker {marker:#x}")
+        length = self.uleb128()
+        return self._read(length).decode("utf-8")
+
+
+HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def peek_beatmap_md5(path):
+    """Cheaply read just the beatmap hash from the start of a replay file, so
+    big replay folders don't mean fully reading every file."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+        r = Reader(head)
+        if r.byte() > 3:  # game mode
+            return None
+        r.int()  # version
+        md5 = r.string()
+        return md5.lower() if md5 and HEX32.match(md5) else None
+    except (EOFError, ValueError, OSError, UnicodeDecodeError):
+        return None
+
+
+def parse_osr_header(path):
+    """Parse the replay header up to the timestamp."""
+    with open(path, "rb") as f:
+        r = Reader(f.read())
+    d = {"path": path}
+    d["mode"] = r.byte()
+    d["version"] = r.int()
+    d["beatmap_md5"] = r.string()
+    d["player_name"] = r.string()
+    r.string()  # replay md5, unused
+    d["n300"] = r.short()
+    d["n100"] = r.short()
+    d["n50"] = r.short()
+    d["ngeki"] = r.short()
+    d["nkatu"] = r.short()
+    d["nmiss"] = r.short()
+    d["score"] = r.int()
+    d["max_combo"] = r.short()
+    d["perfect"] = r.byte() != 0
+    d["mods"] = r.int()
+    r.string()  # life bar graph, unused
+    d["timestamp"] = r.long()
+    # Everything after this (compressed cursor/key frames, online score id)
+    # is irrelevant here, so it's deliberately not read: fewer ways for an
+    # oddly-written file to make a real play invisible.
+    return d
+
+
+def find_replays(map_md5):
+    matches = []
+    dirs_found = []
+    for label, directory in REPLAY_DIRS:
+        if not os.path.isdir(directory):
+            continue
+        dirs_found.append(label)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file() or not entry.name.lower().endswith(".osr"):
+                continue  # e.g. the .osg spectator files that sit beside Data/r replays
+            if peek_beatmap_md5(entry.path) != map_md5:
+                continue
+            try:
+                header = parse_osr_header(entry.path)
+            except (EOFError, ValueError, struct.error, OSError, UnicodeDecodeError):
+                continue
+            header["source"] = label
+            matches.append(header)
+    return matches, dirs_found
+
+
+def resolve_current_map():
+    if not os.path.isfile(CURRENT_STATE):
+        print("No current map tracked yet — is 'osu-current watch' running?", file=sys.stderr)
+        sys.exit(1)
+    with open(CURRENT_STATE, "r", encoding="utf-8") as f:
+        path = f.read().strip()
+    if not os.path.isfile(path):
+        print(f"Tracked map file doesn't exist: {path}", file=sys.stderr)
+        sys.exit(1)
+    return path
+
+
+def analyze_judgements(rp):
+    """Per-mode accuracy (osu.ppy.sh/wiki/Accuracy), a display string, the
+    number of judged objects, and the hit-count kwargs rosu-pp wants."""
+    mode = rp["mode"]
+    n300, n100, n50 = rp["n300"], rp["n100"], rp["n50"]
+    geki, katu, miss = rp["ngeki"], rp["nkatu"], rp["nmiss"]
+
+    if mode == 0:
+        judged = n300 + n100 + n50 + miss
+        acc = (300 * n300 + 100 * n100 + 50 * n50) / (300 * judged) * 100 if judged else 0.0
+        text = f"{n300}/{n100}/{n50}/{miss}"
+        kwargs = dict(n300=n300, n100=n100, n50=n50, misses=miss, combo=rp["max_combo"])
+    elif mode == 1:
+        judged = n300 + n100 + miss
+        acc = (n300 + 0.5 * n100) / judged * 100 if judged else 0.0
+        text = f"{n300} GREAT / {n100} GOOD / {miss} miss"
+        kwargs = dict(n300=n300, n100=n100, misses=miss, combo=rp["max_combo"])
+    elif mode == 2:
+        # catch: 300=fruits, 100=drops, 50=droplets, katu=missed droplets,
+        # miss=missed fruits+drops. geki is not part of accuracy.
+        judged = n300 + n100 + n50 + miss + katu
+        acc = (n300 + n100 + n50) / judged * 100 if judged else 0.0
+        text = (f"{n300} fruits / {n100} drops / {n50} droplets / "
+                f"{katu} droplets missed / {miss} missed")
+        kwargs = dict(n300=n300, n100=n100, n50=n50, n_katu=katu, misses=miss,
+                      combo=rp["max_combo"])
+    else:
+        judged = geki + n300 + katu + n100 + n50 + miss
+        acc = ((300 * (geki + n300) + 200 * katu + 100 * n100 + 50 * n50)
+               / (300 * judged) * 100 if judged else 0.0)
+        text = f"{geki} MAX / {n300} 300 / {katu} 200 / {n100} 100 / {n50} 50 / {miss} miss"
+        kwargs = dict(n_geki=geki, n300=n300, n_katu=katu, n100=n100, n50=n50, misses=miss)
+
+    return acc, text, judged, kwargs
+
+
+def ticks_to_str(ticks):
+    """Replay timestamps are .NET ticks (100ns since year 1)."""
+    try:
+        secs = (ticks - 621355968000000000) / 10_000_000
+        return datetime.datetime.fromtimestamp(secs).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "unknown time"
+
+
+def print_list(matches, limit=10):
+    ordered = sorted(matches, key=lambda h: h["timestamp"], reverse=True)
+    print(f"{len(ordered)} local play(s) on this map, newest first "
+          f"(showing {min(limit, len(ordered))}):\n")
+    for rp in ordered[:limit]:
+        if rp["mode"] not in MODE_NAMES:
+            continue
+        acc, _, _, _ = analyze_judgements(rp)
+        miss = rp["nmiss"]
+        print(f"  {ticks_to_str(rp['timestamp'])}  {MODE_NAMES[rp['mode']]:<10} "
+              f"{mods_to_string(rp['mods']):<8} {acc:6.2f}%  "
+              f"{miss:>3} miss  {rp['max_combo']:>5}x   [{rp['source']}]")
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a != "--list" for a in args):
+        print("Usage: osu-recent [--list]", file=sys.stderr)
+        sys.exit(2)
+
+    map_path = resolve_current_map()
+    with open(map_path, "rb") as f:
+        map_md5 = hashlib.md5(f.read()).hexdigest()
+
+    matches, dirs_found = find_replays(map_md5)
+
+    if not dirs_found:
+        print("No replay folders found. Looked in:", file=sys.stderr)
+        for label, directory in REPLAY_DIRS:
+            print(f"  {directory}", file=sys.stderr)
+        sys.exit(1)
+
+    if not matches:
+        print(f"No local replay found for the current map (searched: {', '.join(dirs_found)}).",
+              file=sys.stderr)
+        print("Plays only show up here once osu! has written them to disk.", file=sys.stderr)
+        sys.exit(1)
+
+    if "--list" in args:
+        print_list(matches)
+        return
+
+    try:
+        import rosu_pp_py as rosu
+    except ImportError:
+        print("Needs rosu-pp-py: pip install rosu-pp-py", file=sys.stderr)
+        sys.exit(1)
+
+    rp = max(matches, key=lambda h: h["timestamp"])
+    mode = rp["mode"]
+    if mode not in MODE_NAMES:
+        print(f"Unrecognised game mode {mode} in {rp['path']}", file=sys.stderr)
+        sys.exit(1)
+
+    accuracy, judgement_text, judged, pp_kwargs = analyze_judgements(rp)
+
+    beatmap = rosu.Beatmap(path=map_path)
+    mode_enum = {0: rosu.GameMode.Osu, 1: rosu.GameMode.Taiko,
+                 2: rosu.GameMode.Catch, 3: rosu.GameMode.Mania}[mode]
+    converted = False
+    if beatmap.mode != mode_enum:
+        beatmap.convert(mode_enum, rp["mods"])
+        converted = True
+
+    mods_str = mods_to_string(rp["mods"])
+    print(f"{rp['player_name']}'s last local play  —  {MODE_NAMES[mode]}"
+          f"{' (convert)' if converted else ''}  {mods_str}   [{rp['source']}]")
+    print(judgement_text)
+
+    # Completeness check: a full pass judges every object. Data/r only ever
+    # holds passes, so this can only fire for a replay exported to Replays/.
+    # Only defined for modes where the object count is unambiguous.
+    expected = None
+    if mode == 0:
+        expected = beatmap.n_circles + beatmap.n_sliders + beatmap.n_spinners
+    elif mode == 1 and not converted:
+        expected = beatmap.n_circles
+
+    perfect_tag = "   FC" if rp["perfect"] else ""
+    print(f"acc {accuracy:.2f}%   combo {rp['max_combo']}x{perfect_tag}")
+
+    if expected is not None and judged < expected:
+        print(f"\nIncomplete play: {judged} of {expected} objects judged "
+              "(looks like a fail or quit) — pp not shown.")
+        return
+
+    perf = rosu.Performance(mods=rp["mods"], lazer=False, **pp_kwargs)
+    real = perf.calculate(beatmap)
+
+    max_combo = getattr(real.difficulty, "max_combo", None)
+    if max_combo and mode != 3:
+        print(f"max combo on this map: {max_combo}x")
+
+    print(f"\n{real.difficulty.stars:.2f}*")
+    print(f"  actual play          -> {real.pp:.1f}pp")
+
+    if mode != 3:  # combo doesn't affect mania pp, so an "FC" comparison means nothing there
+        # Standard "if FC": every miss becomes a 300 (fruit, in catch), all
+        # other judgements stay as they were, and the combo is unbroken.
+        fc_kwargs = dict(pp_kwargs)
+        fc_kwargs["n300"] += fc_kwargs["misses"]
+        fc_kwargs["misses"] = 0
+        fc_kwargs.pop("combo", None)
+        fc_attrs = rosu.Performance(mods=rp["mods"], lazer=False, **fc_kwargs).calculate(beatmap)
+        delta = fc_attrs.pp - real.pp
+        print(f"  misses as 300s, FC   -> {fc_attrs.pp:.1f}pp"
+              + (f"  (+{delta:.1f}pp)" if delta > 0.05 else ""))
+
+    if mode == 3 and rp["mods"] & SCORE_V2:
+        print("\nNote: ScoreV2 uses different accuracy weighting for MAX; "
+              "the accuracy shown is the standard formula.")
+
+
+if __name__ == "__main__":
+    main()

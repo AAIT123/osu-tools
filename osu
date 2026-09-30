@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# osu — central command.
+# No args: launches osu-wine in the background.
+# Any subcommand: dispatches to an "osu-<subcommand>" executable, git-style.
+#
+# Add a new tool anytime by dropping an executable named "osu-something"
+# into TOOLS_DIR below — no edits to this file needed.
+
+set -euo pipefail
+
+# Where your little helper scripts live (osu-bpm, osu-whatever, ...)
+TOOLS_DIR="${OSU_TOOLS_DIR:-$HOME/.local/share/osu-tools}"
+
+# The actual command that launches osu! via wine on your system.
+# Change this one line if your setup uses a different launcher/path.
+OSU_LAUNCH_CMD="${OSU_LAUNCH_CMD:-osu-wine}"
+
+list_tools() {
+    echo "osu — usage:"
+    echo "  osu                launch osu! (via: $OSU_LAUNCH_CMD)"
+    echo "  osu <tool> [args]  run a helper tool"
+    echo
+    echo "Available tools in $TOOLS_DIR:"
+    local found=0
+    if [ -d "$TOOLS_DIR" ]; then
+        for f in "$TOOLS_DIR"/osu-*; do
+            [ -e "$f" ] || continue
+            [ -x "$f" ] || continue
+            name="$(basename "$f")"
+            echo "  ${name#osu-}"
+            found=1
+        done
+    fi
+    if [ "$found" -eq 0 ]; then
+        echo "  (none found)"
+    fi
+}
+
+# No arguments at all: launch the game, detached, and return control
+# of the terminal immediately.
+if [ "$#" -eq 0 ]; then
+    # Start the "what map am I on" tracker if nothing is already watching, so
+    # tools like osu-fix-video -c and osu-bpm-offset --current always have
+    # something fresh to point at. Detection is by actual running process
+    # (pgrep), not a pidfile — so this won't double-launch a duplicate even
+    # if you started one manually yourself (e.g. `osu current watch &`).
+    watch_tool="$TOOLS_DIR/osu-current"
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}"
+    watch_log="$cache_dir/osu-current-watch.log"
+    if [ -x "$watch_tool" ]; then
+        if ! pgrep -f -- "${watch_tool} watch\$" >/dev/null 2>&1; then
+            mkdir -p "$cache_dir"
+            nohup "$watch_tool" watch >"$watch_log" 2>&1 &
+            watch_pid="$!"
+            disown
+            # Give it a moment to fail fast (e.g. inotify watch limit) so we
+            # can surface that now instead of it dying silently in the background.
+            sleep 0.5
+            if ! kill -0 "$watch_pid" 2>/dev/null; then
+                echo "Note: osu-current watch failed to start — see $watch_log" >&2
+                tail -n 20 "$watch_log" >&2
+            fi
+        fi
+    fi
+
+    nohup "$OSU_LAUNCH_CMD" >/dev/null 2>&1 &
+    disown
+    echo "Launched osu! in background (pid $!)"
+    exit 0
+fi
+
+case "$1" in
+    -h|--help|help|list)
+        list_tools
+        exit 0
+        ;;
+esac
+
+sub="$1"; shift
+tool="$TOOLS_DIR/osu-$sub"
+
+if [ -x "$tool" ]; then
+    exec "$tool" "$@"
+else
+    echo "Unknown subcommand: '$sub'" >&2
+    echo >&2
+    list_tools >&2
+    exit 1
+fi

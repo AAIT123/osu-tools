@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# osu-fix-video — Fixes the video freeze in osu!stable (issue #1197)
+#
+# Usage:
+#   osu-fix-video                        # processes whatever map you have open right now
+#   osu-fix-video -a                     # processes ALL folders in Songs
+#   osu-fix-video -s <pattern>           # search by name and pick which one to fix
+#   osu-fix-video <folder1> ...          # processes specific folders
+#
+# The default mode (and -a) require 'osu-current watch' to be running in
+# the background (no tosu needed — see the osu-current script).
+#
+# Refuses to run while osu! looks open (rewriting a video file it has open
+# can corrupt it); pass --force (anywhere in the args) to skip that check.
+
+set -euo pipefail
+
+OSU_SONGS="${HOME}/.local/share/osu-wine/osu!/Songs"
+CURRENT_STATE="${OSU_CURRENT_STATE:-$HOME/.cache/osu-current-map}"
+
+osu_running_pid() {
+    local pid_dir pid cmdline
+    for pid_dir in /proc/[0-9]*; do
+        [[ -r "$pid_dir/cmdline" ]] || continue
+        pid="${pid_dir#/proc/}"
+        cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)"
+        if [[ "${cmdline,,}" == *"osu!.exe"* ]]; then
+            printf '%s\t%s\n' "$pid" "${cmdline:0:100}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+log()  { echo -e "${CYAN}[osu-fix]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[  OK  ]${RESET} $*"; }
+skip() { echo -e "${YELLOW}[ SKIP ]${RESET} $*"; }
+err()  { echo -e "${RED}[ ERR  ]${RESET} $*" >&2; }
+
+get_current_map() {
+    if [[ ! -f "$CURRENT_STATE" ]]; then
+        err "No map detected yet — is 'osu-current watch' running?"
+        exit 1
+    fi
+    local osu_file dir
+    osu_file="$(cat "$CURRENT_STATE")"
+    dir="$(dirname "$osu_file")"
+    if [[ ! -d "$dir" ]]; then
+        err "Tracked folder no longer exists: $dir"
+        exit 1
+    fi
+    echo "$dir"
+}
+
+find_video_in_osu() {
+    local dir="$1"
+    local video_name
+    video_name=$(grep -rhoP --include='*.osu' \
+        '^(?:Video|0),-?\d+,"\K[^"]*\.(?:mp4|avi|mkv|mov|wmv|flv|m4v|webm)(?=")' \
+        "$dir" 2>/dev/null | head -1)
+    echo "$video_name"
+}
+
+fix_beatmap() {
+    local dir="$1"
+    local video_name
+    video_name=$(find_video_in_osu "$dir")
+
+    if [[ -z "$video_name" ]]; then
+        skip "$(basename "$dir")  → no video referenced"
+        return 0
+    fi
+
+    local video_path="${dir}/${video_name}"
+
+    if [[ ! -f "$video_path" ]]; then
+        skip "$(basename "$dir")  → '$video_name' not found on disk"
+        return 0
+    fi
+
+    local fmt
+    fmt=$(ffprobe -v error -show_entries format=format_name \
+          -of default=noprint_wrappers=1:nokey=1 "$video_path" 2>/dev/null || true)
+    if [[ "$fmt" == *"flv"* ]]; then
+        skip "$(basename "$dir")  → '$video_name' is already FLV"
+        return 0
+    fi
+
+    log "Processing: $(basename "$dir") → '$video_name'"
+
+    local tmp_path="${video_path}.fixing.flv"
+
+    if ffmpeg -y -loglevel error -stats \
+        -fflags +genpts \
+        -i "$video_path" \
+        -c:v copy -an \
+        "$tmp_path" 2>/dev/null; then
+        mv "$tmp_path" "$video_path"
+        ok "Done: '$video_name'"
+        return 0
+    fi
+    rm -f "$tmp_path"
+
+    # The fast path (stream copy) failed, almost always because the source
+    # codec (commonly old Xvid/MPEG-4 AVIs) isn't one FLV's spec allows to
+    # carry unchanged. Forcing it through anyway with -strict -1 does make
+    # ffmpeg write a file, but testing showed that file can misreport its
+    # own stream count on read-back and fail to fully decode — not a safe
+    # fix. Re-encoding to FLV's own native codec is slower but produces a
+    # file that's actually sound, at the cost of a small, one-time quality
+    # loss on just this video.
+    log "Stream copy rejected (source codec isn't FLV-legal); re-encoding instead..."
+    if ffmpeg -y -loglevel error -stats \
+        -fflags +genpts \
+        -i "$video_path" \
+        -c:v flv -an \
+        "$tmp_path"; then
+        mv "$tmp_path" "$video_path"
+        ok "Done (re-encoded): '$video_name'"
+    else
+        rm -f "$tmp_path"
+        err "Conversion failed for '$video_name' in $(basename "$dir")"
+        return 1
+    fi
+}
+
+search_and_pick() {
+    local pattern="$1"
+
+    local matches=()
+    while IFS= read -r -d '' dir; do
+        matches+=("$dir")
+    done < <(find "$OSU_SONGS" -mindepth 1 -maxdepth 1 -type d -name "*${pattern}*" -print0)
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        err "No folder found matching pattern: '$pattern'"
+        exit 1
+    fi
+
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        log "One match found, processing directly..."
+        fix_beatmap "${matches[0]}"
+        return
+    fi
+
+    echo -e "\n${BOLD}Results for '$pattern':${RESET}\n"
+    local i=1
+    for dir in "${matches[@]}"; do
+        echo -e "  ${CYAN}${i})${RESET} $(basename "$dir")"
+
+        local creator
+        creator=$(grep -rh --include='*.osu' -m1 '^Creator:' "$dir" 2>/dev/null \
+                  | head -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//;s/ *$//')
+        [[ -n "$creator" ]] && echo -e "       ${YELLOW}Mapper:${RESET} $creator"
+
+        local diffs=()
+        while IFS= read -r line; do
+            diffs+=("$(echo "$line" | cut -d: -f2- | tr -d '\r' | sed 's/^ *//;s/ *$//')")
+        done < <(grep -rh --include='*.osu' '^Version:' "$dir" 2>/dev/null)
+
+        if [[ ${#diffs[@]} -gt 0 ]]; then
+            local joined
+            printf -v joined '%s, ' "${diffs[@]}"
+            echo -e "       ${YELLOW}Diffs:${RESET}  ${joined%, }"
+        fi
+
+        echo
+        ((i++))
+    done
+    echo -e "  ${CYAN}a)${RESET} All\n"
+
+    local choice
+    read -rp "Which one to fix? (number or 'a'): " choice
+
+    if [[ "$choice" == "a" ]]; then
+        for dir in "${matches[@]}"; do
+            fix_beatmap "$dir" || true
+        done
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
+        fix_beatmap "${matches[$((choice - 1))]}"
+    else
+        err "Invalid choice: '$choice'"
+        exit 1
+    fi
+}
+
+main() {
+    local force=0
+    local -a args=()
+    for a in "$@"; do
+        if [[ "$a" == "--force" ]]; then
+            force=1
+        else
+            args+=("$a")
+        fi
+    done
+    set -- "${args[@]}"
+
+    if ! command -v ffmpeg &>/dev/null || ! command -v ffprobe &>/dev/null; then
+        err "ffmpeg/ffprobe not found. Install it first."
+        exit 1
+    fi
+
+    if [[ ! -d "$OSU_SONGS" ]]; then
+        err "Songs folder not found at: $OSU_SONGS"
+        err "Edit the OSU_SONGS variable at the top of the script."
+        exit 1
+    fi
+
+    if [[ "$force" -eq 0 ]]; then
+        local osu_proc
+        if osu_proc="$(osu_running_pid)"; then
+            err "osu! looks like it's running (pid $(cut -f1 <<< "$osu_proc"))."
+            err "Rewriting a video file it has open can corrupt it or fail outright."
+            err "Close osu! first, or re-run with --force if you're sure."
+            exit 1
+        fi
+    fi
+
+    # No args, or explicit -c/--current: target whatever map you're on right now.
+    if [[ $# -eq 0 || "${1:-}" == "-c" || "${1:-}" == "--current" ]]; then
+        local current_dir
+        current_dir="$(get_current_map)"
+        log "Current map: $(basename "$current_dir")"
+        fix_beatmap "$current_dir"
+        return
+    fi
+
+    if [[ "${1:-}" == "-s" ]]; then
+        if [[ -z "${2:-}" ]]; then
+            err "Usage: osu-fix-video -s <pattern>"
+            exit 1
+        fi
+        search_and_pick "$2"
+        return
+    fi
+
+    if [[ "${1:-}" == "-a" || "${1:-}" == "--all" ]]; then
+        local targets=()
+        while IFS= read -r -d '' dir; do
+            targets+=("$dir")
+        done < <(find "$OSU_SONGS" -mindepth 1 -maxdepth 1 -type d -print0)
+
+        local total=${#targets[@]} errors=0
+        echo -e "\n${BOLD}osu! video freeze fix — ${total} folder(s)${RESET}\n"
+        for dir in "${targets[@]}"; do
+            fix_beatmap "$dir" || ((errors++)) || true
+        done
+        echo -e "\n${BOLD}Summary:${RESET} ${total} folders processed, ${errors} errors."
+        return
+    fi
+
+    local errors=0
+    for dir in "$@"; do
+        fix_beatmap "$dir" || ((errors++)) || true
+    done
+    echo -e "\n${BOLD}Summary:${RESET} $# folders processed, ${errors} errors."
+}
+
+main "$@"

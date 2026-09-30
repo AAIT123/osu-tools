@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+osu-collections — finds maps that have silently dropped out of your
+collections, entirely offline (no tosu, no API key).
+
+Why this happens: osu! collections store beatmaps by MD5 hash of the
+.osu file, not by name. If a mapper updates a map (or you re-download a
+different version), the hash changes and the old collection entry no
+longer points at anything — it just silently stops showing up in-game.
+There is no way to recover what a dead entry *used to be*; the hash is
+all collection.db ever stored. This tool's job is to tell you exactly
+how many entries in each collection are affected, so "a few maps go
+missing" turns into a real number instead of a vague feeling.
+
+Reads directly from osu!'s own binary db files, implemented from
+https://github.com/ppy/osu/wiki/Legacy-database-file-structure
+Read-only — this script never writes to osu!.db or collection.db.
+
+Usage:
+    osu-collections                    # summary across all collections
+    osu-collections show <name>        # full listing for one collection (partial name match)
+    osu-collections sync-loved         # dry run: sync 'all loved' against osu!.db's ranked status
+    osu-collections sync-loved --apply # actually write it (backs up collection.db first)
+    osu-collections sync-modes         # dry run: sync ctb/std all/taiko all/mania all from 'all'
+    osu-collections sync-modes --apply # actually write it (backs up collection.db first)
+    osu-collections sync-variants         # dry run: ensure variant collections' maps
+                                           # are also in '<group> all' and 'all'
+    osu-collections sync-variants --apply # actually write it (backs up collection.db first)
+
+--apply refuses to run while osu! looks open (collection.db could be
+overwritten by the game on exit); --force skips that check.
+"""
+
+import os
+import struct
+import sys
+
+OSU_SONGS = os.environ.get(
+    "OSU_SONGS", os.path.expanduser("~/.local/share/osu-wine/osu!/Songs")
+)
+OSU_ROOT = os.path.dirname(OSU_SONGS.rstrip("/"))
+OSU_DB_PATH = os.path.join(OSU_ROOT, "osu!.db")
+COLLECTION_DB_PATH = os.path.join(OSU_ROOT, "collection.db")
+
+
+# ---------------------------------------------------------------- binary IO
+
+class Reader:
+    def __init__(self, data: bytes):
+        self.buf = data
+        self.pos = 0
+
+    def _read(self, n):
+        b = self.buf[self.pos:self.pos + n]
+        if len(b) != n:
+            raise EOFError(f"expected {n} bytes at offset {self.pos}, got {len(b)}")
+        self.pos += n
+        return b
+
+    def byte(self):
+        return self._read(1)[0]
+
+    def short(self):
+        return struct.unpack("<H", self._read(2))[0]
+
+    def int(self):
+        return struct.unpack("<i", self._read(4))[0]
+
+    def long(self):
+        return struct.unpack("<q", self._read(8))[0]
+
+    def single(self):
+        return struct.unpack("<f", self._read(4))[0]
+
+    def double(self):
+        return struct.unpack("<d", self._read(8))[0]
+
+    def boolean(self):
+        return self.byte() != 0
+
+    def uleb128(self):
+        result, shift = 0, 0
+        while True:
+            b = self.byte()
+            result |= (b & 0x7F) << shift
+            if (b & 0x80) == 0:
+                break
+            shift += 7
+        return result
+
+    def string(self):
+        marker = self.byte()
+        if marker == 0x00:
+            return None
+        if marker != 0x0B:
+            raise ValueError(f"bad string marker {marker:#x} at offset {self.pos - 1}")
+        length = self.uleb128()
+        return self._read(length).decode("utf-8")
+
+    def eof(self):
+        return self.pos >= len(self.buf)
+
+
+class Writer:
+    def __init__(self):
+        self.parts = []
+
+    def bytes(self):
+        return b"".join(self.parts)
+
+    def byte(self, v):
+        self.parts.append(struct.pack("<B", v))
+
+    def int(self, v):
+        self.parts.append(struct.pack("<i", v))
+
+    def uleb128(self, v):
+        out = bytearray()
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            if v:
+                out.append(b | 0x80)
+            else:
+                out.append(b)
+                break
+        self.parts.append(bytes(out))
+
+    def string(self, s):
+        if s is None:
+            self.byte(0x00)
+            return
+        self.byte(0x0B)
+        data = s.encode("utf-8")
+        self.uleb128(len(data))
+        self.parts.append(data)
+
+
+# ---------------------------------------------------------------- osu!.db
+
+def parse_beatmap_entry(r: Reader, db_version: int):
+    e = {}
+    if db_version < 20191106:
+        r.int()  # entry size, unused
+
+    e["artist"] = r.string()
+    r.string()  # artist unicode
+    e["title"] = r.string()
+    r.string()  # title unicode
+    e["creator"] = r.string()
+    e["difficulty"] = r.string()
+    r.string()  # audio filename
+    e["md5"] = r.string()
+    e["osu_filename"] = r.string()
+    e["ranked_status"] = r.byte()
+    r.short(); r.short(); r.short()  # circle/slider/spinner counts
+    r.long()  # last mod time
+
+    if db_version < 20140609:
+        r.byte(); r.byte(); r.byte(); r.byte()
+    else:
+        r.single(); r.single(); r.single(); r.single()
+
+    r.double()  # slider velocity
+
+    if db_version >= 20140609:
+        for _mode in range(4):
+            count = r.int()
+            for _ in range(count):
+                r.byte(); r.int(); r.byte()
+                if db_version >= 20250107:
+                    r.single()
+                else:
+                    r.double()
+
+    r.int(); r.int(); r.int()  # drain/total/preview time
+
+    n_timing = r.int()
+    for _ in range(n_timing):
+        r.double(); r.double(); r.boolean()
+
+    r.int(); r.int(); r.int()  # difficulty/beatmap/thread id
+    r.byte(); r.byte(); r.byte(); r.byte()  # grades
+    r.short()   # local offset
+    r.single()  # stack leniency
+    e["mode"] = r.byte()
+    r.string(); r.string()  # source, tags
+    r.short()   # online offset
+    r.string()  # title font
+    r.boolean()  # unplayed
+    r.long()     # last played
+    r.boolean()  # is osz2
+    e["folder_name"] = r.string()
+    r.long()     # last checked
+    r.boolean(); r.boolean(); r.boolean(); r.boolean(); r.boolean()
+
+    if db_version < 20140609:
+        r.short()
+
+    r.int()   # last mod time 2
+    r.byte()  # mania scroll speed
+
+    return e
+
+
+def parse_osu_db(path):
+    with open(path, "rb") as f:
+        r = Reader(f.read())
+    version = r.int()
+    r.int()       # folder count
+    r.boolean()   # account unlocked
+    r.long()      # unlock date
+    r.string()    # player name
+    n = r.int()
+    beatmaps = [parse_beatmap_entry(r, version) for _ in range(n)]
+    r.int()  # permissions
+    return version, beatmaps
+
+
+def parse_collection_db(path):
+    with open(path, "rb") as f:
+        r = Reader(f.read())
+    version = r.int()
+    n = r.int()
+    collections = []
+    for _ in range(n):
+        name = r.string()
+        n_maps = r.int()
+        hashes = [r.string() for _ in range(n_maps)]
+        collections.append((name, hashes))
+    return version, collections
+
+
+def write_collection_db(version, collections):
+    w = Writer()
+    w.int(version)
+    w.int(len(collections))
+    for name, hashes in collections:
+        w.string(name)
+        w.int(len(hashes))
+        for h in hashes:
+            w.string(h)
+    return w.bytes()
+
+
+def backup_and_write_collection_db(version, collections):
+    """Backs up the existing collection.db, then atomically replaces it.
+    Never overwrites a previous backup, even if called twice within the
+    same second."""
+    import shutil
+    import time
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup_path = f"{COLLECTION_DB_PATH}.bak.{ts}"
+    n = 1
+    while os.path.exists(backup_path):
+        n += 1
+        backup_path = f"{COLLECTION_DB_PATH}.bak.{ts}-{n}"
+    shutil.copy2(COLLECTION_DB_PATH, backup_path)
+
+    data = write_collection_db(version, collections)
+    tmp_path = COLLECTION_DB_PATH + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+    os.replace(tmp_path, COLLECTION_DB_PATH)
+    return backup_path
+
+
+# ---------------------------------------------------------------- sync logic
+
+MODE_NAMES = {0: "osu!std", 1: "osu!taiko", 2: "osu!catch", 3: "osu!mania"}
+LOVED_STATUS = 7
+
+
+def find_collection(collections, name):
+    for i, (cname, hashes) in enumerate(collections):
+        if cname == name:
+            return i
+    return None
+
+
+def sync_loved(by_md5, collections, apply=False):
+    idx = find_collection(collections, "all loved")
+    if idx is None:
+        print("No collection named 'all loved' found — nothing to sync.", file=sys.stderr)
+        sys.exit(1)
+
+    name, current_hashes = collections[idx]
+    current_set = set(current_hashes)
+
+    loved_hashes = {md5 for md5, bm in by_md5.items() if bm["ranked_status"] == LOVED_STATUS}
+
+    to_add = loved_hashes - current_set
+    to_remove = {h for h in current_set if h in by_md5 and by_md5[h]["ranked_status"] != LOVED_STATUS}
+
+    print(f"'all loved': {len(current_set)} current entries")
+    print(f"  {len(to_add)} loved map(s) to add")
+    for h in list(to_add)[:5]:
+        bm = by_md5[h]
+        print(f"    + {bm['artist']} - {bm['title']} [{bm['difficulty']}]")
+    if len(to_add) > 5:
+        print(f"    ... and {len(to_add) - 5} more")
+
+    print(f"  {len(to_remove)} entry(ies) no longer loved, to remove")
+    for h in list(to_remove)[:5]:
+        bm = by_md5[h]
+        print(f"    - {bm['artist']} - {bm['title']} [{bm['difficulty']}]")
+    if len(to_remove) > 5:
+        print(f"    ... and {len(to_remove) - 5} more")
+
+    if not to_add and not to_remove:
+        print("\nAlready in sync, nothing to do.")
+        return None
+
+    new_set = (current_set | to_add) - to_remove
+    collections[idx] = (name, sorted(new_set))
+
+    if not apply:
+        print("\nDry run only — re-run with --apply to write this to collection.db")
+        return None
+
+    return collections
+
+
+def sync_variants(by_md5, collections, apply=False):
+    """Every map in a '<group> <variant>' collection (e.g. 'taiko hd') must
+    also be present in '<group> all' (e.g. 'taiko all') and in the root
+    'all' collection. Inclusion-only: never removes anything."""
+    changed = False
+    root_idx = find_collection(collections, "all")
+    if root_idx is None:
+        print("No collection named 'all' found.", file=sys.stderr)
+        sys.exit(1)
+
+    for group in ("taiko", "mania"):
+        prefix = f"{group} "
+        group_all_name = f"{group} all"
+        variant_hashes = set()
+        for name, hashes in collections:
+            if name.lower().startswith(prefix) and name.lower() != group_all_name:
+                variant_hashes.update(hashes)
+
+        if not variant_hashes:
+            continue
+
+        for target_name in (group_all_name, "all"):
+            idx = find_collection(collections, target_name)
+            if idx is None:
+                print(f"  (skipping '{target_name}': no such collection)")
+                continue
+            name, current_hashes = collections[idx]
+            current_set = set(current_hashes)
+            to_add = variant_hashes - current_set
+
+            print(f"'{target_name}': {len(to_add)} map(s) from {group} variant "
+                  f"collections missing here")
+            for h in list(to_add)[:5]:
+                bm = by_md5.get(h)
+                label = f"{bm['artist']} - {bm['title']} [{bm['difficulty']}]" if bm else h
+                print(f"    + {label}")
+            if len(to_add) > 5:
+                print(f"    ... and {len(to_add) - 5} more")
+
+            if to_add:
+                changed = True
+                collections[idx] = (name, sorted(current_set | to_add))
+        print()
+
+    if not changed:
+        print("Already in sync, nothing to do.")
+        return None
+
+    if not apply:
+        print("Dry run only — re-run with --apply to write this to collection.db")
+        return None
+
+    return collections
+
+
+def sync_modes(by_md5, collections, apply=False):
+    mode_collection = {0: "std all", 1: "taiko all", 2: "ctb", 3: "mania all"}
+
+    source_idx = find_collection(collections, "all")
+    if source_idx is None:
+        print("No collection named 'all' found — nothing to sync from.", file=sys.stderr)
+        sys.exit(1)
+    _, all_hashes = collections[source_idx]
+
+    changed = False
+    for mode, coll_name in mode_collection.items():
+        idx = find_collection(collections, coll_name)
+        if idx is None:
+            print(f"  (skipping '{coll_name}': no such collection)")
+            continue
+
+        name, current_hashes = collections[idx]
+        current_set = set(current_hashes)
+
+        to_add = {
+            h for h in all_hashes
+            if h in by_md5 and by_md5[h]["mode"] == mode and h not in current_set
+        }
+        to_remove = {
+            h for h in current_set
+            if h in by_md5 and by_md5[h]["mode"] != mode
+        }
+
+        print(f"'{coll_name}' ({MODE_NAMES[mode]}): {len(current_set)} current entries")
+        print(f"  {len(to_add)} to add (from 'all', matching mode, missing here)")
+        for h in list(to_add)[:3]:
+            bm = by_md5[h]
+            print(f"    + {bm['artist']} - {bm['title']} [{bm['difficulty']}]")
+        if len(to_add) > 3:
+            print(f"    ... and {len(to_add) - 3} more")
+
+        wrong_modes = sorted({MODE_NAMES[by_md5[h]["mode"]] for h in to_remove}) if to_remove else []
+        print(f"  {len(to_remove)} to remove (wrong mode: {', '.join(wrong_modes)})")
+        for h in list(to_remove)[:3]:
+            bm = by_md5[h]
+            print(f"    - {bm['artist']} - {bm['title']} [{bm['difficulty']}]  (actually {MODE_NAMES[bm['mode']]})")
+        if len(to_remove) > 3:
+            print(f"    ... and {len(to_remove) - 3} more")
+
+        if to_add or to_remove:
+            changed = True
+            new_set = (current_set | to_add) - to_remove
+            collections[idx] = (name, sorted(new_set))
+        print()
+
+    if not changed:
+        print("Already in sync, nothing to do.")
+        return None
+
+    if not apply:
+        print("Dry run only — re-run with --apply to write this to collection.db")
+        return None
+
+    return collections
+
+
+# ---------------------------------------------------------------- CLI
+
+def find_osu_process():
+    """Return (pid, description) if an osu!.exe process exists, else None."""
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as f:
+                comm = f.read().decode(errors="replace").strip()
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue
+        if "osu!.exe" in comm.lower() or "osu!.exe" in cmd.lower():
+            return int(pid), (cmd or comm)[:100]
+    return None
+
+
+def main():
+    if not os.path.isfile(OSU_DB_PATH):
+        print(f"osu!.db not found at: {OSU_DB_PATH}", file=sys.stderr)
+        print("(set $OSU_SONGS if your install is somewhere else)", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(COLLECTION_DB_PATH):
+        print(f"collection.db not found at: {COLLECTION_DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _, beatmaps = parse_osu_db(OSU_DB_PATH)
+    except (EOFError, ValueError) as e:
+        print(f"Couldn't parse osu!.db: {e}", file=sys.stderr)
+        print("(the binary format may have changed — this reads it per the", file=sys.stderr)
+        print(" 2025-03-22 revision of ppy/osu's own format spec)", file=sys.stderr)
+        sys.exit(1)
+
+    by_md5 = {bm["md5"]: bm for bm in beatmaps if bm["md5"]}
+
+    try:
+        collection_version, collections = parse_collection_db(COLLECTION_DB_PATH)
+    except (EOFError, ValueError) as e:
+        print(f"Couldn't parse collection.db: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    args = sys.argv[1:]
+
+    if args and args[0] in ("sync-loved", "sync-modes", "sync-variants"):
+        apply = "--apply" in args
+        if apply and "--force" not in args:
+            proc = find_osu_process()
+            if proc:
+                print(f"osu! looks like it's running (pid {proc[0]}: {proc[1]}).", file=sys.stderr)
+                print("collection.db can be overwritten by the game on exit, silently undoing "
+                      "this write. Close osu! first, or re-run with --force if you're sure.",
+                      file=sys.stderr)
+                sys.exit(1)
+        if args[0] == "sync-loved":
+            result = sync_loved(by_md5, collections, apply=apply)
+        elif args[0] == "sync-modes":
+            result = sync_modes(by_md5, collections, apply=apply)
+        else:
+            result = sync_variants(by_md5, collections, apply=apply)
+        if apply and result is not None:
+            backup_path = backup_and_write_collection_db(collection_version, result)
+            print(f"\nWrote collection.db. Backup saved to:\n  {backup_path}")
+        return
+
+    if args and args[0] == "show":
+        if len(args) < 2:
+            print("Usage: osu-collections show <collection name>", file=sys.stderr)
+            sys.exit(1)
+        query = args[1].lower()
+        matches = [c for c in collections if query in c[0].lower()]
+        if not matches:
+            print(f"No collection matching '{args[1]}'")
+            names = ", ".join(f"'{c[0]}'" for c in collections)
+            print(f"Available: {names}")
+            sys.exit(1)
+        for name, hashes in matches:
+            print(f"\n{name}  ({len(hashes)} maps)")
+            for h in hashes:
+                bm = by_md5.get(h)
+                if bm is None:
+                    print(f"  [MISSING]  {h}")
+                    continue
+                folder_path = os.path.join(OSU_SONGS, bm["folder_name"] or "")
+                on_disk = os.path.isdir(folder_path)
+                tag = "" if on_disk else "  (folder not on disk!)"
+                print(f"  {bm['artist']} - {bm['title']} [{bm['difficulty']}]{tag}")
+        return
+
+    # Default: summary across every collection.
+    print(f"{len(collections)} collection(s), {len(beatmaps)} beatmaps known to osu!.db\n")
+    total_missing = 0
+    for name, hashes in collections:
+        missing = [h for h in hashes if h not in by_md5]
+        total_missing += len(missing)
+        status = "OK" if not missing else f"{len(missing)} MISSING"
+        print(f"  {name:<40} {len(hashes):>4} maps   {status}")
+
+    if total_missing:
+        print(f"\n{total_missing} total entries across all collections point at maps "
+              "that no longer resolve.")
+        print("These can't be identified — collection.db only ever stored the hash, "
+              "never a name — but 'osu-collections show <name>' will tell you exactly "
+              "which collections they're in and how many, so you can go re-add them "
+              "if you remember what they were.")
+    else:
+        print("\nNo missing entries in any collection.")
+
+
+if __name__ == "__main__":
+    main()

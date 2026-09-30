@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+osu-pp — local, offline pp calculator. No tosu, no browser extension, no
+Discord bot: rosu-pp (the same difficulty/pp algorithm those all lean on
+under the hood) runs directly against the .osu file.
+
+Install:
+    pip install rosu-pp-py
+
+Usage:
+    osu-pp                              # current map: FC pp at 95/97/98/99/100%, no mods
+    osu-pp path/to/file.osu             # explicit map instead of the current one
+    osu-pp --mods HDDT                  # apply mods (acronyms, e.g. HD, DT, HR, HDDT, HDHR...)
+    osu-pp --acc 90,95,99               # custom accuracy spread instead of the default
+    osu-pp --acc 98.5 --combo 700 --misses 2   # pp for one specific score, not a spread
+    osu-pp --mode taiko                 # play this map as taiko / catch / mania / std (converts)
+    osu-pp --mode mania --mods 6K       # mania converts take a key count as a mod (4K..9K)
+
+Works for all four modes. A map is calculated in its own mode unless --mode
+says otherwise.
+"""
+
+import argparse
+import os
+import sys
+
+CURRENT_STATE = os.environ.get(
+    "OSU_CURRENT_STATE",
+    os.path.expanduser("~/.cache/osu-current-map"),
+)
+
+
+def resolve_current_map():
+    if not os.path.isfile(CURRENT_STATE):
+        print(
+            "No current map tracked yet — is 'osu-current watch' running?\n"
+            f"(expected a path in {CURRENT_STATE})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    with open(CURRENT_STATE, "r", encoding="utf-8") as f:
+        path = f.read().strip()
+    if not os.path.isfile(path):
+        print(f"Tracked map file doesn't exist: {path}", file=sys.stderr)
+        sys.exit(1)
+    return path
+
+
+def read_metadata(osu_path):
+    """Just enough of the Metadata section for a header line."""
+    meta = {}
+    try:
+        with open(osu_path, "r", encoding="utf-8-sig") as f:
+            in_meta = False
+            for line in f:
+                stripped = line.strip()
+                if stripped == "[Metadata]":
+                    in_meta = True
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_meta = False
+                    continue
+                if in_meta and ":" in stripped:
+                    k, _, v = stripped.partition(":")
+                    meta[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return meta
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Local pp calculator (rosu-pp) for the current or a given map."
+    )
+    parser.add_argument(
+        "map", nargs="?", help=".osu file (defaults to the current map via osu-current)"
+    )
+    parser.add_argument("--mods", default="", help="mod acronyms, e.g. HD, DT, HDDT, HR")
+    parser.add_argument(
+        "--acc",
+        default="95,97,98,99,100",
+        help="comma-separated accuracy spread for FC pp (default: 95,97,98,99,100)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["std", "taiko", "catch", "mania"],
+        help="calculate as this mode (converts the map if it isn't natively that mode)",
+    )
+    parser.add_argument("--combo", type=int, help="combo for a single-score calculation")
+    parser.add_argument(
+        "--misses", type=int, default=0, help="misses for a single-score calculation"
+    )
+    args = parser.parse_args()
+
+    try:
+        import rosu_pp_py as rosu
+    except ImportError:
+        print("Needs rosu-pp-py: pip install rosu-pp-py", file=sys.stderr)
+        sys.exit(1)
+
+    map_path = args.map or resolve_current_map()
+
+    try:
+        beatmap = rosu.Beatmap(path=map_path)
+    except Exception as e:
+        print(f"Couldn't parse {map_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if beatmap.is_suspicious():
+        print("rosu-pp flagged this map as suspicious; refusing to calculate.", file=sys.stderr)
+        sys.exit(1)
+
+    # (rosu's GameMode values aren't hashable, so no dict keyed on them)
+    def mode_label(m):
+        for candidate, label in (
+            (rosu.GameMode.Osu, "osu!"),
+            (rosu.GameMode.Taiko, "osu!taiko"),
+            (rosu.GameMode.Catch, "osu!catch"),
+            (rosu.GameMode.Mania, "osu!mania"),
+        ):
+            if m == candidate:
+                return label
+        return str(m)
+
+    requested = {
+        "std": rosu.GameMode.Osu,
+        "taiko": rosu.GameMode.Taiko,
+        "catch": rosu.GameMode.Catch,
+        "mania": rosu.GameMode.Mania,
+    }.get(args.mode)
+    converted = False
+    if requested is not None and beatmap.mode != requested:
+        try:
+            beatmap.convert(requested, args.mods or 0)
+        except Exception as e:
+            print(f"Couldn't convert to {args.mode}: {e}", file=sys.stderr)
+            sys.exit(1)
+        converted = True
+
+    meta = read_metadata(map_path)
+    title = f"{meta.get('Artist', '?')} - {meta.get('Title', '?')} [{meta.get('Version', '?')}]"
+    print(title)
+    mode = beatmap.mode
+    print(f"{mode_label(mode)}{' (convert)' if converted else ''}")
+
+    mods_kwargs = {"mods": args.mods} if args.mods else {}
+
+    def attr_line(ar, cs, od, hp, bpm):
+        # Which difficulty settings matter depends on the mode.
+        if mode == rosu.GameMode.Taiko:
+            return f"OD {od:.1f}  HP {hp:.1f}  BPM {bpm:.0f}"
+        if mode == rosu.GameMode.Mania:
+            return f"{cs:.0f}K  OD {od:.1f}  HP {hp:.1f}  BPM {bpm:.0f}"
+        return f"AR {ar:.1f}  CS {cs:.1f}  OD {od:.1f}  HP {hp:.1f}  BPM {bpm:.0f}"
+
+    # Post-mod attributes, shown separately from pp since they don't need a score.
+    try:
+        battrs = rosu.BeatmapAttributesBuilder(mode=mode, **mods_kwargs)
+        battrs.set_map(beatmap)
+        b = battrs.build()
+        bpm = beatmap.bpm * b.clock_rate
+        print(f"{attr_line(b.ar, b.cs, b.od, b.hp, bpm)}  ({args.mods or 'NM'})")
+    except Exception:
+        print(
+            f"{attr_line(beatmap.ar, beatmap.cs, beatmap.od, beatmap.hp, beatmap.bpm)}"
+            "  (base, pre-mod)"
+        )
+
+    perf = rosu.Performance(lazer=False, **mods_kwargs)
+
+    if args.combo is not None or args.misses:
+        # A specific score, not a spread.
+        acc = float(args.acc.split(",")[0])
+        perf.set_accuracy(acc)
+        perf.set_misses(args.misses)
+        if args.combo is not None:
+            perf.set_combo(args.combo)
+        attrs = perf.calculate(beatmap)
+        print(f"\n{attrs.difficulty.stars:.2f}*  acc={acc}%  combo={args.combo or 'FC'}  "
+              f"misses={args.misses}  ->  {attrs.pp:.1f}pp")
+        return
+
+    # Default: FC pp across an accuracy spread, reusing attrs for speed.
+    accs = [float(a) for a in args.acc.split(",")]
+    prev = None
+    print()
+    stars_shown = False
+    for acc in accs:
+        perf.set_accuracy(acc)
+        perf.set_misses(0)
+        perf.set_combo(None)
+        attrs = perf.calculate(prev if prev is not None else beatmap)
+        if not stars_shown:
+            print(f"{attrs.difficulty.stars:.2f}*")
+            stars_shown = True
+        print(f"  {acc:>6.2f}%  FC  ->  {attrs.pp:6.1f}pp")
+        prev = attrs
+
+
+if __name__ == "__main__":
+    main()

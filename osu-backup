@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+osu-backup — verified backups of the osu! files that are painful to lose,
+with an optional "rebuild scores.db from Data/r" step.
+
+What gets backed up (to ~/osu-backups/<timestamp>/, or $OSU_BACKUP_DIR):
+    collection.db   your collections. Can't be rebuilt.
+    scores.db       the local-score index. Rebuildable from Data/r, but only
+                    for scores whose replay file still exists.
+    Data/r          the replay behind every passed local score (.osr).
+                    The .osg spectator files next to them are skipped;
+                    the osu! wiki says they can be safely removed.
+    osu!.db         only with --with-osudb. Rebuildable, but reprocessing a
+                    huge library takes a long time, and restoring a good copy
+                    beats that.
+
+Every database copy is verified by SHA-256 before the backup counts. Replay
+backups are incremental: replays are immutable, so unchanged ones are
+hardlinked to the previous backup instead of copied again.
+
+Refuses to run while osu! is open; these files are rewritten by the game and
+a copy taken mid-write is worthless.
+
+Usage:
+    osu-backup                     # back everything up, keep the newest 10
+    osu-backup --with-osudb        # also osu!.db
+    osu-backup --keep 30           # keep more (or fewer) backups
+    osu-backup --list              # show existing backups
+    osu-backup --rebuild-scores    # back up, then remove scores.db so osu!
+                                   # recreates it from Data/r on next launch
+
+To restore: close osu!, then copy the files from a backup folder back into
+the osu! folder (collection.db, scores.db, osu!.db) or Data/r.
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import struct
+import sys
+import time
+
+OSU_SONGS = os.environ.get(
+    "OSU_SONGS", os.path.expanduser("~/.local/share/osu-wine/osu!/Songs")
+)
+OSU_ROOT = os.path.dirname(OSU_SONGS.rstrip("/"))
+BACKUP_DIR = os.environ.get("OSU_BACKUP_DIR", os.path.expanduser("~/osu-backups"))
+NAME_RE = re.compile(r"^\d{8}-\d{6}(-\d+)?$")
+TARGET_PRACTICE = 8388608
+
+
+# ------------------------------------------------------------ osu! running?
+
+def find_osu_process():
+    """Return (pid, description) if an osu!.exe process exists, else None."""
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as f:
+                comm = f.read().decode(errors="replace").strip()
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue
+        if "osu!.exe" in comm.lower() or "osu!.exe" in cmd.lower():
+            return int(pid), (cmd or comm)[:100]
+    return None
+
+
+# ---------------------------------------------------------- scores.db reader
+
+class Reader:
+    def __init__(self, data):
+        self.buf, self.pos = data, 0
+
+    def _read(self, n):
+        b = self.buf[self.pos:self.pos + n]
+        if len(b) != n:
+            raise EOFError(f"expected {n} bytes at offset {self.pos}")
+        self.pos += n
+        return b
+
+    def byte(self):
+        return self._read(1)[0]
+
+    def short(self):
+        return struct.unpack("<H", self._read(2))[0]
+
+    def int(self):
+        return struct.unpack("<i", self._read(4))[0]
+
+    def long(self):
+        return struct.unpack("<q", self._read(8))[0]
+
+    def double(self):
+        return struct.unpack("<d", self._read(8))[0]
+
+    def uleb128(self):
+        result, shift = 0, 0
+        while True:
+            b = self.byte()
+            result |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return result
+            shift += 7
+
+    def string(self):
+        marker = self.byte()
+        if marker == 0x00:
+            return None
+        if marker != 0x0B:
+            raise ValueError(f"bad string marker {marker:#x} at offset {self.pos - 1}")
+        return self._read(self.uleb128()).decode("utf-8")
+
+    def eof(self):
+        return self.pos >= len(self.buf)
+
+
+def count_scores(path):
+    """Number of scores in scores.db, per ppy's documented layout. Raises on
+    anything that doesn't parse exactly, so a wrong count is never reported."""
+    with open(path, "rb") as f:
+        r = Reader(f.read())
+    r.int()  # version
+    total = 0
+    for _ in range(r.int()):  # beatmaps
+        r.string()  # beatmap md5
+        for _ in range(r.int()):  # scores on it
+            r.byte(); r.int(); r.string(); r.string(); r.string()
+            for _ in range(6):
+                r.short()  # 300/100/50/geki/katu/miss
+            r.int(); r.short(); r.byte()
+            mods = r.int()
+            r.string()  # life bar, always empty here
+            r.long(); r.int(); r.long()  # timestamp, -1, online id
+            if mods & TARGET_PRACTICE:
+                r.double()
+            total += 1
+    if not r.eof():
+        raise ValueError(f"{len(r.buf) - r.pos} unexpected trailing bytes")
+    return total
+
+
+# ----------------------------------------------------------------- helpers
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def list_backups():
+    try:
+        names = os.listdir(BACKUP_DIR)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if NAME_RE.match(n) and os.path.isdir(os.path.join(BACKUP_DIR, n)))
+
+
+def replay_files(directory):
+    try:
+        return [e for e in os.scandir(directory)
+                if e.is_file() and e.name.lower().endswith(".osr")]
+    except OSError:
+        return []
+
+
+class BackupError(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ backup
+
+def make_backup(with_osudb):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    final = os.path.join(BACKUP_DIR, stamp)
+    n = 1
+    while os.path.exists(final):
+        n += 1
+        final = os.path.join(BACKUP_DIR, f"{stamp}-{n}")
+    partial = os.path.join(BACKUP_DIR, f".{os.path.basename(final)}.partial")
+    previous = list_backups()
+    prev_dir = os.path.join(BACKUP_DIR, previous[-1]) if previous else None
+
+    os.makedirs(partial)
+    lines = [f"created: {time.strftime('%Y-%m-%d %H:%M:%S')}", f"source: {OSU_ROOT}"]
+    try:
+        names = ["collection.db", "scores.db"] + (["osu!.db"] if with_osudb else [])
+        for name in names:
+            src = os.path.join(OSU_ROOT, name)
+            if not os.path.isfile(src):
+                print(f"  {name:<15} not found, skipped")
+                continue
+            dst = os.path.join(partial, name)
+            shutil.copy2(src, dst)
+            digest = sha256(src)
+            if digest != sha256(dst):
+                raise BackupError(f"{name}: copy does not match the original")
+            size = os.path.getsize(dst)
+            print(f"  {name:<15} {human(size):>10}   verified")
+            lines.append(f"{name}: {size} bytes sha256 {digest}")
+
+        r_src = os.path.join(OSU_ROOT, "Data", "r")
+        if os.path.isdir(r_src):
+            r_dst = os.path.join(partial, "Data", "r")
+            os.makedirs(r_dst)
+            prev_r = os.path.join(prev_dir, "Data", "r") if prev_dir else None
+            can_link = bool(prev_r and os.path.isdir(prev_r))
+            linked = copied = total_bytes = 0
+            for e in replay_files(r_src):
+                st = e.stat()
+                total_bytes += st.st_size
+                dst = os.path.join(r_dst, e.name)
+                if can_link:
+                    try:
+                        old = os.path.join(prev_r, e.name)
+                        ps = os.stat(old)
+                        if ps.st_size == st.st_size and int(ps.st_mtime) == int(st.st_mtime):
+                            os.link(old, dst)
+                            linked += 1
+                            continue
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        can_link = False  # linking not possible here; plain copies
+                shutil.copy2(e.path, dst)
+                copied += 1
+
+            after = replay_files(r_dst)
+            if len(after) != linked + copied or sum(x.stat().st_size for x in after) != total_bytes:
+                raise BackupError("Data/r: backup doesn't match the original")
+            skipped = sum(1 for e in os.scandir(r_src)
+                          if e.is_file() and not e.name.lower().endswith(".osr"))
+            print(f"  {'Data/r':<15} {len(after):>6} replays, {human(total_bytes)}   verified "
+                  f"({linked} unchanged/shared, {copied} copied; "
+                  f"{skipped} non-.osr files skipped)")
+            lines.append(f"Data/r: {len(after)} replays, {total_bytes} bytes")
+        else:
+            print(f"  {'Data/r':<15} not found, skipped")
+
+        with open(os.path.join(partial, "MANIFEST.txt"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.rename(partial, final)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    return final
+
+
+def prune(keep):
+    backups = list_backups()
+    doomed = backups[:-keep] if len(backups) > keep else []
+    for name in doomed:
+        shutil.rmtree(os.path.join(BACKUP_DIR, name))
+    if doomed:
+        print(f"  pruned {len(doomed)} older backup(s), keeping the newest {keep}")
+
+
+# --------------------------------------------------------- scores.db rebuild
+
+def rebuild_scores(backup_path, assume_yes):
+    scores = os.path.join(OSU_ROOT, "scores.db")
+    if not os.path.isfile(scores):
+        print("\nNo scores.db to remove; osu! will already build one from Data/r.")
+        return True
+
+    replays = len(replay_files(os.path.join(OSU_ROOT, "Data", "r")))
+    try:
+        n_scores = count_scores(scores)
+    except (EOFError, ValueError, struct.error, UnicodeDecodeError) as e:
+        n_scores = None
+        print(f"\nCouldn't read scores.db to compare it with Data/r ({e}).")
+
+    print(f"\nscores.db lists {n_scores if n_scores is not None else '?'} score(s); "
+          f"Data/r has {replays} replay(s).")
+    if replays == 0:
+        print("Data/r has no replays, so a rebuild would leave you with no local scores. "
+              "Refusing.")
+        return False
+    if n_scores is not None and n_scores > replays:
+        print(f"At least {n_scores - replays} score(s) have no replay file, and won't come "
+              "back after a rebuild.")
+    print("A rebuild only recreates scores that still have a replay in Data/r, and on a "
+          "big library it can take a long time.")
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("Not a terminal and no --yes given; leaving scores.db alone.")
+            return False
+        answer = input("Remove scores.db so osu! rebuilds it from Data/r? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Left scores.db alone.")
+            return False
+
+    os.remove(scores)
+    print("\nRemoved scores.db. Start osu! and let it finish rebuilding.")
+    print(f"To undo (with osu! closed): cp '{os.path.join(backup_path, 'scores.db')}' "
+          f"'{scores}'")
+    return True
+
+
+# -------------------------------------------------------------------- main
+
+def show_list():
+    backups = list_backups()
+    if not backups:
+        print(f"No backups in {BACKUP_DIR}")
+        return
+    print(f"{len(backups)} backup(s) in {BACKUP_DIR}:\n")
+    for name in backups:
+        path = os.path.join(BACKUP_DIR, name)
+        have = [f for f in ("collection.db", "scores.db", "osu!.db")
+                if os.path.isfile(os.path.join(path, f))]
+        n = len(replay_files(os.path.join(path, "Data", "r")))
+        print(f"  {name}   {', '.join(have) or 'no db files'}   {n} replays")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Verified backups of osu!'s collection, score and replay files.")
+    ap.add_argument("--with-osudb", action="store_true", help="also back up osu!.db (large)")
+    ap.add_argument("--keep", type=int, default=10, help="backups to keep (default 10)")
+    ap.add_argument("--list", action="store_true", help="list existing backups and exit")
+    ap.add_argument("--rebuild-scores", action="store_true",
+                    help="after backing up, remove scores.db so osu! rebuilds it from Data/r")
+    ap.add_argument("--yes", action="store_true", help="don't ask before removing scores.db")
+    ap.add_argument("--force", action="store_true",
+                    help="back up even if osu! looks open (never applies to --rebuild-scores)")
+    args = ap.parse_args()
+
+    if args.keep < 1:
+        print("--keep must be at least 1", file=sys.stderr)
+        sys.exit(2)
+
+    if args.list:
+        show_list()
+        return
+
+    proc = find_osu_process()
+    if proc and (args.rebuild_scores or not args.force):
+        print(f"osu! looks like it's running (pid {proc[0]}: {proc[1]}).", file=sys.stderr)
+        print("Close it first: these files are rewritten by the game, so a copy taken "
+              "now could be unusable.", file=sys.stderr)
+        if not args.rebuild_scores:
+            print("If osu! is definitely closed, re-run with --force.", file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.isdir(OSU_ROOT):
+        print(f"osu! folder not found: {OSU_ROOT}", file=sys.stderr)
+        print("(set $OSU_SONGS if your install is somewhere else)", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Backing up {OSU_ROOT}\n")
+    try:
+        path = make_backup(args.with_osudb)
+    except (BackupError, OSError) as e:
+        print(f"\nBackup FAILED: {e}", file=sys.stderr)
+        print("Nothing was removed.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nBacked up to {path}")
+    prune(args.keep)
+
+    if args.rebuild_scores:
+        if not rebuild_scores(path, args.yes):
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

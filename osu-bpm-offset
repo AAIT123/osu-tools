@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+osu! BPM & Offset detector
+
+Estimates a precise BPM and starting offset directly from an audio file
+using beat-tracking (librosa), instead of manual tapping. Also scans the
+track in windows to flag likely tempo changes.
+
+Install:
+    pip install librosa numpy soundfile
+
+Usage:
+    python osu_bpm_offset.py                 # current map (default; needs osu-current watch running)
+    python osu_bpm_offset.py path/to/song.mp3 # explicit audio file instead
+"""
+
+import os
+import sys
+import numpy as np
+import librosa
+
+CURRENT_STATE = os.environ.get(
+    "OSU_CURRENT_STATE",
+    os.path.expanduser("~/.cache/osu-current-map"),
+)
+
+
+def long_baseline_bpm(beat_times):
+    """More accurate than a plain average: use the first & last beat over
+    the widest gap available, so per-beat detection error gets divided
+    down across many beats instead of compounding."""
+    if len(beat_times) < 2:
+        return None
+    span_ms = (beat_times[-1] - beat_times[0]) * 1000
+    n_beats = len(beat_times) - 1
+    if span_ms <= 0:
+        return None
+    return 60000 * n_beats / span_ms
+
+
+def analyze(path, window_sec=20, hop_sec=10):
+    y, sr = librosa.load(path, sr=None, mono=True)
+    duration = librosa.get_duration(y=y, sr=sr)
+
+    # --- Overall estimate ---
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+
+    if len(beat_times) == 0:
+        print("No beats detected — try a louder/cleaner section, or the "
+              "track may have too weak a beat for automatic detection.")
+        return
+
+    overall_bpm = long_baseline_bpm(beat_times)
+    offset_ms = beat_times[0] * 1000
+
+    print("=== Overall estimate ===")
+    tempo_val = float(np.asarray(tempo).reshape(-1)[0])
+    if overall_bpm:
+        print(f"BPM (long-baseline, whole track): {overall_bpm:.2f}")
+    print(f"Raw beat-tracker tempo guess:      {tempo_val:.2f}")
+    print(f"Suggested offset (first beat):     {offset_ms:.1f} ms")
+    print(f"Total beats detected: {len(beat_times)}")
+
+    # --- Windowed scan, to flag tempo changes ---
+    print("\n=== Windowed scan (spot tempo changes) ===")
+    windows = []
+    t = 0.0
+    while t < duration:
+        start_sample = int(t * sr)
+        end_sample = int(min(t + window_sec, duration) * sr)
+        if end_sample - start_sample < sr:  # skip tiny trailing slice
+            break
+        y_win = y[start_sample:end_sample]
+        w_tempo, w_beat_frames = librosa.beat.beat_track(y=y_win, sr=sr, units="frames")
+        w_beat_times = librosa.frames_to_time(w_beat_frames, sr=sr)
+        w_bpm = long_baseline_bpm(w_beat_times) if len(w_beat_times) > 1 else None
+        windows.append((t, w_bpm))
+        t += hop_sec
+
+    prev_bpm = None
+    for start, bpm in windows:
+        flag = ""
+        if bpm and prev_bpm and abs(bpm - prev_bpm) > 1.0:
+            flag = "  <-- possible tempo change starts near here"
+        bpm_str = f"{bpm:.2f}" if bpm else "n/a"
+        print(f"  t={start:6.1f}s  BPM~{bpm_str}{flag}")
+        if bpm:
+            prev_bpm = bpm
+
+    any_flagged = any(
+        p and c and abs(c - p) > 1.0
+        for (_, p), (_, c) in zip(windows, windows[1:])
+    )
+    if any_flagged:
+        print(
+            "\n⚠ Tempo changes were flagged above, so the 'Overall' BPM is "
+            "not reliable for the whole track. Crop each section (e.g. "
+            "`ffmpeg -i song.mp3 -ss <start> -to <end> section.wav`) and "
+            "re-run this script on each piece to get an accurate BPM/offset "
+            "per red timing point."
+        )
+    else:
+        print(
+            "\nNo tempo changes flagged — type the 'Overall' BPM and offset "
+            "straight into osu!'s Timing panel fields, no tapping needed. "
+            "Offset is usually accurate to roughly ±15ms; nudge it slightly "
+            "while listening to the in-editor metronome if it feels early/late."
+        )
+
+
+def resolve_current_audio():
+    """Find the audio file for the exact difficulty osu-current last saw opened."""
+    if not os.path.isfile(CURRENT_STATE):
+        print(
+            "No current map tracked yet — is 'osu-current watch' running?\n"
+            f"(expected a path in {CURRENT_STATE})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    with open(CURRENT_STATE, "r", encoding="utf-8") as f:
+        osu_file = f.read().strip()
+
+    if not os.path.isfile(osu_file):
+        print(f"Tracked map file doesn't exist: {osu_file}", file=sys.stderr)
+        sys.exit(1)
+
+    map_dir = os.path.dirname(osu_file)
+
+    audio_filename = None
+    with open(osu_file, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            if line.strip().startswith("AudioFilename:"):
+                audio_filename = line.split(":", 1)[1].strip()
+                break
+
+    if not audio_filename:
+        print(f"Couldn't find AudioFilename in {os.path.basename(osu_file)}", file=sys.stderr)
+        sys.exit(1)
+
+    audio_path = os.path.join(map_dir, audio_filename)
+    if not os.path.isfile(audio_path):
+        print(f"Audio file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Current map: {os.path.basename(map_dir)}")
+    print(f"Audio file:  {audio_filename}\n")
+    return audio_path
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("--current", "-c"):
+        target = resolve_current_audio()
+    else:
+        target = sys.argv[1]
+
+    analyze(target)

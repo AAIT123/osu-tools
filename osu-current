@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# osu-current — tracks the exact .osu difficulty file you most recently
+# opened for play or editing, without needing a memory reader (tosu/gosumemory).
+#
+# How it works: watches Songs/ with inotify for .osu files being opened.
+# osu! reads a difficulty's .osu file whenever you actually enter Play or
+# the editor on it, so the most recently opened .osu file is a solid proxy
+# for "the exact difficulty I'm currently on".
+#
+# Caveats (read before relying on this):
+#   - It only knows the last map osu! *read from disk* — not whether
+#     you're in a menu, mid-play, or on results screen, and not live
+#     stats (pp/combo/accuracy). For that you still need tosu.
+#   - Star-rating recalculation on browsing can occasionally touch a
+#     .osu file too, so during fast song-select scrolling this may update
+#     a beat before you expect. In practice it settles on whatever you
+#     actually opened for play/edit.
+#   - Recursive inotify watches use one kernel watch per folder. A huge
+#     Songs library (thousands of maps) can hit the default
+#     fs.inotify.max_user_watches limit — `watch` checks for this up front
+#     and prints the exact sysctl command to fix it if so.
+#   - If you'd rather not touch kernel limits at all, the other option is
+#     fanotify (e.g. the `fatrace` tool), which can watch a whole mount
+#     point with a single watch instead of one per folder — but it needs
+#     root or CAP_SYS_ADMIN, which is a bigger ask than raising a sysctl.
+#     Not implemented here; mentioned for completeness.
+#
+# Usage:
+#   osu-current watch     # run the watcher (leave this running in the bg)
+#   osu-current           # print the currently tracked .osu file's full path
+#   osu-current get       # same as above
+#   osu-current path      # same as above
+#   osu-current folder    # print just the containing beatmapset folder
+
+set -euo pipefail
+
+OSU_SONGS="${OSU_SONGS:-$HOME/.local/share/osu-wine/osu!/Songs}"
+STATE_FILE="${OSU_CURRENT_STATE:-$HOME/.cache/osu-current-map}"
+
+watch() {
+    command -v inotifywait >/dev/null 2>&1 || {
+        echo "osu-current: needs inotify-tools (sudo pacman -S inotify-tools)" >&2
+        exit 1
+    }
+    [[ -d "$OSU_SONGS" ]] || {
+        echo "osu-current: Songs folder not found at $OSU_SONGS (override with \$OSU_SONGS)" >&2
+        exit 1
+    }
+
+    # A recursive inotify watch needs one kernel watch per folder (one per
+    # beatmapset, roughly). Large libraries can exceed the default
+    # fs.inotify.max_user_watches before inotifywait even starts, so check
+    # up front and give an exact fix instead of a cryptic failure partway
+    # through setup.
+    local needed current_limit
+    needed=$(( $(find "$OSU_SONGS" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) + 1 ))
+    current_limit="${OSU_CURRENT_WATCH_LIMIT_OVERRIDE:-$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo 8192)}"
+
+    if (( needed > current_limit )); then
+        local recommended=$(( ((needed * 2 / 100000) + 1) * 100000 ))
+        {
+            echo "osu-current: your Songs folder needs ~$needed watches (one per"
+            echo "             beatmapset folder), but fs.inotify.max_user_watches"
+            echo "             is only $current_limit. Raise it (cheap — a few hundred"
+            echo "             bytes of kernel memory per watch):"
+            echo
+            echo "               sudo sysctl -w fs.inotify.max_user_watches=$recommended"
+            echo
+            echo "             To make that stick across reboots:"
+            echo
+            echo "               echo 'fs.inotify.max_user_watches=$recommended' |"
+            echo "                 sudo tee /etc/sysctl.d/99-osu-inotify.conf"
+            echo
+            echo "             (rounded up to leave headroom as your library grows)"
+        } >&2
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$STATE_FILE")"
+    echo "osu-current: watching $OSU_SONGS ($needed folders) ..." >&2
+
+    inotifywait -mrq -e open --format '%w%f' "$OSU_SONGS" |
+    while IFS= read -r filepath; do
+        [[ "$filepath" == *.osu ]] || continue
+        printf '%s' "$filepath" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    done
+}
+
+get() {
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "osu-current: no map seen yet — is 'osu-current watch' running?" >&2
+        exit 1
+    fi
+    cat "$STATE_FILE"
+}
+
+folder() {
+    dirname "$(get)"
+}
+
+case "${1:-get}" in
+    watch) watch ;;
+    get|path) get ;;
+    folder) folder ;;
+    *)
+        echo "Usage: osu-current [watch|get|folder]" >&2
+        exit 1
+        ;;
+esac

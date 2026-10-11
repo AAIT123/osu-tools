@@ -123,12 +123,19 @@ def cached_beatmaps(path: Path, *, refresh=False, enabled=True, inform=None):
         if (not refresh and entry.get('fingerprint') == stamp and file.is_file()
                 and not file.is_symlink()):
             try:
-                rows = list(_read_jsonl(file, entry['sha256']))
-                if len(rows) != entry['count']:
+                # Construct the lookup while streaming verified JSONL.
+                # Do not retain a second full list of metadata dictionaries:
+                # that doubles peak memory on large, low-RAM libraries.
+                maps = {}
+                count = 0
+                for row in _read_jsonl(file, entry['sha256']):
+                    bm = Beatmap(**row)
+                    if bm.md5 in maps:
+                        raise ValueError('Duplicate checksum in index')
+                    maps[bm.md5] = bm
+                    count += 1
+                if count != entry['count']:
                     raise ValueError('Index row count differs from manifest')
-                maps = {row['md5']: Beatmap(**row) for row in rows}
-                if len(maps) != len(rows):
-                    raise ValueError('Duplicate checksum in index')
                 _ensure_source(path, stamp)
                 return entry['version'], entry['player'], maps
             except (KeyError, TypeError, ValueError, OSError):

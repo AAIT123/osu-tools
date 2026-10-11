@@ -68,20 +68,22 @@ def _map_entry(r: Reader, version: int) -> Beatmap:
     r.skip(4 if version < 20140609 else 16) # AR/CS/HP/OD
     r.double() # slider velocity
     if version >= 20140609:
+        # Every star-rating pair has a fixed layout: type(1), mods(4),
+        # type(1), value(4 or 8). We do not use the rating or mod values.
+        # Read at most 1.4 MiB per mode instead of four Python I/O calls
+        # per pair; still verify EVERY pair's markers before continuing.
+        pair_size = 10 if version >= 20250107 else 14
+        rating_marker = 0x0c if version >= 20250107 else 0x0d
         for _ in range(4):
-            for _ in range(r.count(limit=100_000)):
-                int_marker = r.byte()
-                r.int() # mod bitmask
-                float_marker = r.byte()
-                if int_marker != 0x08 or float_marker != (0x0c if version >= 20250107 else 0x0d):
-                    raise FormatError('Unexpected star rating pair format; unsupported database revision')
-                if version >= 20250107:
-                    r.single()
-                else:
-                    r.double()
+            count = r.count(limit=100_000)
+            data = r.read(count * pair_size)
+            if (data[::pair_size].count(0x08) != count
+                    or data[5::pair_size].count(rating_marker) != count):
+                raise FormatError('Unexpected star rating pair format; unsupported database revision')
     r.skip(12) # drain, total and preview time
-    for _ in range(r.count(limit=10_000_000)):
-        r.skip(17) # timing point
+    # Timing points are fixed-size (17 bytes). Skip the full array in
+    # buffered chunks, retaining the Reader's truncation checks.
+    r.skip(17 * r.count(limit=10_000_000))
     beatmap_id = r.int() # formerly known as difficulty id
     beatmapset_id = r.int() # formerly known as beatmap id
     r.int() # thread id

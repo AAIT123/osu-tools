@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import os
+import tempfile
 from . import paths
 
 NATIVE = {'std': 'std all', 'taiko': 'taiko all', 'ctb': 'ctb', 'mania': 'mania all'}
@@ -70,4 +72,28 @@ def init_policy(path=None) -> Path:
         json.dump(Policy().to_dict(), f, ensure_ascii=False, indent=2)
         f.write('\n')
     path.chmod(0o600)
+    return path
+
+
+def save_policy(policy: Policy, path=None) -> Path:
+    """Atomically save validated explicit collection rules; preserve 0600 mode."""
+    path = Path(path) if path else policy_path()
+    if path.is_symlink():
+        raise ValueError(f'Refusing to overwrite symlink: {path}')
+    # Validate before writing, including invalid or obsolete target additions.
+    data = policy.to_dict()
+    Policy.from_dict(data)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(prefix='.collection-policy-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return path

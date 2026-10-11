@@ -123,8 +123,14 @@ class Client:
     def beatmap_for_checksum(self, checksum):
         return self.get('beatmaps/lookup', {'checksum': checksum})
 
-    def beatmap_scores(self, beatmap_id, mode):
-        return self.get(f'beatmaps/{beatmap_id}/scores', {'mode': mode})
+    def beatmap_scores(self, beatmap_id, mode, *, legacy_only=False):
+        params = {'mode': mode}
+        if legacy_only:
+            params['legacy_only'] = 1
+        return self.get(f'beatmaps/{beatmap_id}/scores', params)
 
-    def user_score(self, beatmap_id, user_id, mode):
-        return self.get(f'beatmaps/{beatmap_id}/scores/users/{user_id}', {'mode': mode})
+    def user_score(self, beatmap_id, user_id, mode, *, legacy_only=False):
+        params = {'mode': mode}
+        if legacy_only:
+            params['legacy_only'] = 1
+        return self.get(f'beatmaps/{beatmap_id}/scores/users/{user_id}', params)

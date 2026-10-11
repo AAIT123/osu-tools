@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from osu_tools.cli import run
+from osu_tools.prelaunch import main_prelaunch
+raise SystemExit(run(main_prelaunch))

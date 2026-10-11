@@ -30,12 +30,14 @@ The installer places scripts and `osu_tools/` in `~/.local/share/osu-tools`, and
 | `osu current` | Last opened `.osu` file (heuristic, not guaranteed live state) | inotify |
 | `osu pp` | Local pp / difficulty calculation | rosu-pp-py |
 | `osu recent` | Last saved replay / pp | local replay files |
+| **`osu scores [recent|best|map|search]`** | Offline saved-score lookup, per-mode accuracy and JSON output | local `scores.db` + readable cache |
 | `osu fix-video` | Video compatibility workaround | ffmpeg |
 | `osu bpm-offset` | Audio timing estimate | librosa |
 | `osu backup` | Verified backups of game data | osu! databases |
 | **`osu library snapshot [--with-replays]`** | Readable JSONL library and local scores, with exact original database copies | local files |
 | `osu library list` | List retained archival snapshots | local files |
-| `osu collections policy-init` / `policy-show` | Manage explicit inclusion rules; no implicit prefix matching | JSON configuration |
+| `osu collections policy-init` / `policy-show` / `policy-add` / `policy-remove` | Manage exact variant-to-aggregate rules without name guessing | JSON configuration |
+| **`osu prelaunch enable --preview`** | Opt into a cheap file-change check before launching the game | local files |
 | **`osu collections sync`** | Order-preserving sync with explicit policy rules (dry-run default) | local osu!.db, collection.db, scores.db |
 | `osu collections sync-variants` | Only policy-listed variant propagation (including converts) | local collections |
 | `osu collections sync-modes` | Explicitly classify root `all` entries by the *difficulty's native mode* (potentially many additions) | local osu!.db |
@@ -44,7 +46,7 @@ The installer places scripts and `osu_tools/` in `~/.local/share/osu-tools`, and
 | `osu collections sync-played` | Add exactly identified saved local-score difficulties to `all played` | local scores.db |
 | `osu collections show NAME` | Show members of matching collection(s) | local DB |
 | **`osu profile [USER] [--mode std]`** | Public pp/rank/profile information | osu! API (opt-in) |
-| **`osu compare [MAP.osu] [--top N]`** | Online beatmap leaderboard and your online score | osu! API (opt-in) |
+| **`osu compare [MAP.osu] [--top N] [--legacy-only]`** | Online beatmap leaderboard and your online score (optional legacy-only filter) | osu! API (opt-in) |
 | **`osu doctor [--deep]`** | Lightweight path/dependency/config diagnostic | local system |
 
 **Database edits are dry-run by default**, require `--apply`, refuse to write if osu! appears to be running, verify a uniquely named backup and atomically replace the original. A bulk-change guard blocks applies exceeding 1,000 additions or 100 removals unless explicitly approved with `--allow-large` (or thresholds adjusted). `--force` overrides the process check but is **unsafe**. Old tools such as `osu fix-video` have their own safety behavior; these new guarantees refer specifically to the refactored `osu collections` commands.
@@ -108,6 +110,28 @@ osu library list
 
 Read [COLLECTIONS.md](COLLECTIONS.md) for the exact personal policy and convert behavior, and [LIBRARY.md](LIBRARY.md) for export, cache invalidation and restore limitations. The original binary files are essential for exact recovery; JSON exports alone aren't reversible into all osu!stable database fields.
 
+## Pre-launch sync and explicit collection policy editing
+
+Optional pre-launch checks are **disabled by default**. After installing, use
+`osu prelaunch enable --preview` to first produce a report when invoking plain
+`osu` (game launch). After reviewing it, `osu prelaunch enable --apply` opts
+into guarded automatic writes, capped at **100 additions / zero removals** per
+run by default. Changing beatmaps, saved scores, collections, or policy causes
+a new check; unchanged files are skipped until the 24-hour interval is due.
+There is no daemon, and a failed sync never prevents the game from starting.
+You can bypass once with `OSU_TOOLS_SKIP_PRELAUNCH=1 osu`.
+
+You can add or remove **specific variant** rules without hand-editing JSON:
+
+```bash
+osu collections policy-add 'taiko dr' 'taiko all'
+osu collections policy-remove 'taiko dr'
+osu collections policy-show
+```
+
+No `std hdhr` rule is created unless you explicitly add it. See
+[PRELAUNCH.md](PRELAUNCH.md) for interval, safety, optional cron and log details.
+
 ## Optimization direction
 
 The refactor centralizes DB readers, config paths, safe writes, collection rules and API transport in the tiny standard-library `osu_tools/` package. The original pp, recent, video, backup, current tracker and BPM scripts remain separate and unchanged in this overlay, avoiding untested rewrites. Follow-up work should migrate their duplicated readers and checks incrementally **with tests**. More features are outlined in [ROADMAP.md](ROADMAP.md); measuring cold-start, large-library memory and actual runtime is more useful than guessing optimizations.
@@ -119,3 +143,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests generate synthetic `.db` files; they do **not** use your files or credentials. See [CORE.md](CORE.md) and [INTEGRATION.md](INTEGRATION.md). When filing an issue, remove usernames, private scores, token files, and other sensitive information before sharing logs.
+
+## Saved local score browsing
+
+`osu scores` shows the latest saved local plays, `osu scores best` ranks by **raw score** (not pp), `osu scores map :current` filters the last tracked difficulty, and `osu scores search 'artist or title'` finds saved scores for installed maps. The `--mode` filter uses the played ruleset (including standard converts), and `--json` produces machine-readable results. See [SCORES.md](SCORES.md).

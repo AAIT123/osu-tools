@@ -10,7 +10,7 @@ from .database import load_beatmaps, load_collections, dump_collections, played_
 from .collections import sync as sync_collection_rules
 from .safety import SafetyError, sha256, write_verified
 from .cache import cached_beatmaps, cached_played_hashes, source_fingerprint
-from .policy import load_policy, init_policy, policy_path
+from .policy import load_policy, init_policy, policy_path, save_policy, ALLOWED_TARGETS
 
 
 COMMANDS = ['sync', 'sync-all', 'sync-modes', 'sync-variants', 'sync-loved', 'sync-played']
@@ -56,8 +56,9 @@ def _report(diff, by_md5):
 def main_collections(argv=None):
     parser = argparse.ArgumentParser(description='Audit and safely sync a personal osu!stable collection layout')
     parser.add_argument('command', nargs='?', default='summary',
-                        choices=['summary', 'show', 'policy-init', 'policy-show', *COMMANDS])
-    parser.add_argument('name', nargs='?', help='Collection to show')
+                        choices=['summary', 'show', 'policy-init', 'policy-show', 'policy-add', 'policy-remove', *COMMANDS])
+    parser.add_argument('name', nargs='?', help='Collection to show or policy variant source')
+    parser.add_argument('destination', nargs='?', help='Policy-add destination mode aggregate')
     parser.add_argument('--policy', help='JSON rules file; default ~/.config/osu-tools/collections.json')
     parser.add_argument('--apply', action='store_true', help='Write changes after verified backup')
     parser.add_argument('--force', action='store_true', help='Override osu! process detection (unsafe)')
@@ -86,6 +87,29 @@ def main_collections(argv=None):
         policy = load_policy(args.policy)
         print(f'Policy: {args.policy or policy_path()}')
         print(json.dumps(policy.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+    if args.command in {'policy-add', 'policy-remove'}:
+        policy = load_policy(args.policy)
+        if not args.name:
+            parser.error(f'{args.command} requires an exact source collection name')
+        if args.command == 'policy-add':
+            if not args.destination or args.destination not in ALLOWED_TARGETS:
+                parser.error('policy-add requires a destination: std all, taiko all, ctb, '
+                             'mania all, taiko converts, ctb converts or mania converts')
+            if args.name == args.destination or args.name in ALLOWED_TARGETS:
+                parser.error('A variant source must be a distinct, non-aggregate collection')
+            previous = policy.variant_sources.get(args.name)
+            policy.variant_sources[args.name] = args.destination
+            save_policy(policy, args.policy)
+            print(f'{"Updated" if previous else "Added"}: {args.name} -> {args.destination}')
+        else:
+            if args.name not in policy.variant_sources:
+                print(f'No configured variant source: {args.name}', file=sys.stderr)
+                return 1
+            del policy.variant_sources[args.name]
+            save_policy(policy, args.policy)
+            print(f'Removed variant source: {args.name}')
+        print('Next sync is a dry run unless --apply is explicitly requested.')
         return 0
     policy = load_policy(args.policy)
     root = paths.osu_root()
@@ -280,6 +304,8 @@ def main_compare(argv=None):
     parser.add_argument('--mode', choices=['std', 'taiko', 'catch', 'mania'])
     parser.add_argument('--top', type=int, default=10)
     parser.add_argument('--user', help='Profile to compare; default local player')
+    parser.add_argument('--legacy-only', action='store_true',
+                        help='Request legacy leaderboard scores (osu!stable) only')
     args = parser.parse_args(argv)
     if not 1 <= args.top <= 50:
         parser.error('--top must be between 1 and 50')
@@ -298,7 +324,7 @@ def main_compare(argv=None):
     print(f'{bmset.get("artist","?")} - {bmset.get("title","?")} '
           f'[{beatmap.get("version","?")}] | {mode} | {beatmap.get("difficulty_rating", 0)}★')
     print(beatmap.get('url') or f'https://osu.ppy.sh/beatmaps/{beatmap["id"]}')
-    data = client.beatmap_scores(beatmap['id'], mode) or {}
+    data = client.beatmap_scores(beatmap['id'], mode, legacy_only=args.legacy_only) or {}
     scores = data.get('scores', []) if isinstance(data, dict) else []
     if not scores:
         print('No public leaderboard scores returned for this map/mode.')
@@ -311,12 +337,62 @@ def main_compare(argv=None):
     if username:
         usr = client.user(username, mode)
         if usr:
-            placement = client.user_score(beatmap['id'], usr['id'], mode)
+            placement = client.user_score(beatmap['id'], usr['id'], mode,
+                                          legacy_only=args.legacy_only)
             if placement and placement.get('score'):
                 print(f'\n{usr.get("username", username)} online: '
                       f'position #{placement.get("position", "?")} | {_score(placement["score"])}')
             else:
                 print(f'\n{usr.get("username", username)}: no online score found')
+    return 0
+
+
+def main_scores(argv=None):
+    """Browse actual locally saved scores without opening the game or API."""
+    import json
+    from .scores import MODE_IDS, enrich, find_scores, map_checksum, match_maps
+    parser = argparse.ArgumentParser(description='Offline osu!stable saved scores (scores.db)')
+    parser.add_argument('command', nargs='?', default='recent', choices=['recent', 'best', 'map', 'search'])
+    parser.add_argument('value', nargs='?', help='Map path/checksum (map), or artist/title/difficulty (search)')
+    parser.add_argument('--limit', type=int, default=20, help='Maximum score rows (1-100)')
+    parser.add_argument('--mode', choices=sorted(MODE_IDS), help='Played ruleset (including converts)')
+    parser.add_argument('--player', help='Filter exactly by player name, case-insensitive')
+    parser.add_argument('--json', action='store_true', help='Machine-readable JSON results')
+    args = parser.parse_args(argv)
+    if not 1 <= args.limit <= 100:
+        parser.error('--limit must be between 1 and 100')
+    if args.command in {'recent', 'best'} and args.value:
+        parser.error(f'{args.command} does not take a positional value')
+    if args.command == 'search' and not args.value:
+        parser.error('search requires part of a beatmap title, artist, or difficulty')
+    maps_path = paths.osu_root() / 'osu!.db'
+    scores_path = paths.osu_root() / 'scores.db'
+    eligible = None
+    if args.command == 'map':
+        eligible = {map_checksum(args.value or ':current')}
+    # Map titles and mode information are always resolved from the existing
+    # readable library cache. No new service or network request is involved.
+    _, _, maps = cached_beatmaps(maps_path)
+    if args.command == 'search':
+        eligible = match_maps(args.value, maps)
+    order = 'best' if args.command == 'best' else 'recent'
+    count, rows = find_scores(scores_path, limit=args.limit, order=order,
+                              mode=MODE_IDS.get(args.mode) if args.mode else None,
+                              player=args.player, eligible=eligible)
+    enriched = [enrich(row, maps) for row in rows]
+    if args.json:
+        print(json.dumps({'matching_count': count, 'scores': enriched},
+                         ensure_ascii=False, indent=2))
+        return 0
+    print(f'{count:,} saved local score(s) match; showing {len(rows)} {order} (not pp-ranked)')
+    for row in enriched:
+        acc = f'{row["accuracy_percent"]:.2f}%' if row['accuracy_percent'] is not None else '? acc'
+        print(f'{row["date_utc"] or "unknown date"} | {row["mode_name"]} | '
+              f'{row["score"]:,} | {acc} | {row["max_combo"]}x | '
+              f'{row["mods"]} | {row["player"]}')
+        print('  ' + row['map_label'])
+    if not count:
+        print('No matching saved scores. Unsaved/failed plays may be absent from scores.db.')
     return 0
 
 

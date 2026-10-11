@@ -1,12 +1,19 @@
 # Architecture
 
-## Why no tosu
+## Why lightweight, local-first commands
 
-tosu (or gosumemory) reads osu!'s live process memory and is the normal way
-to get "what map is currently open" on Linux. It was deliberately avoided
-here — the person wanted this to not depend on a memory reader, a browser
-extension, or a Discord bot. Everything in this repo reads files osu!
-already writes to disk instead.
+This toolkit grew out of using osu!stable on a lower-end Linux machine.
+Opening a browser tab, keeping an overlay running, or messaging a Discord
+bot every time a player wants pp estimates or a score summary is unnecessary
+overhead for many small tasks. The goal is quick commands, low idle resource
+use, and minimal workflow disruption — not opposition to any integration.
+
+Use osu!'s files when they provide trustworthy answers without network
+access. Use the official API when information is online-only (ranks, public
+leaderboards, certain play-history views). An optional tosu-compatible
+adapter may be a better fit for actual live state; it simply should not be
+required to run unrelated offline tools. Each command should state its
+source and limitations.
 
 ## How "current map" tracking actually works (`osu-current`)
 

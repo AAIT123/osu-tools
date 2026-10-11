@@ -1,4 +1,36 @@
+# Python/test state
 __pycache__/
-*.pyc
-*.bak.*
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local cache and readable exports (not repository source)
 .cache/
+snapshots/
+*.sqlite
+*.sqlite3
+*.jsonl
+beatmaps.csv
+scores.csv
+collections.csv
+played.json
+manifest.json
+
+# Personal osu! databases, scores and replays
+osu!.db
+scores.db
+collection.db
+*.db.bak.*
+*.osr
+*.osg
+*.osz
+
+# Credentials and personal collection policies
+.env
+.env.*
+api.conf
+collections.json
+
+# Editor/system artifacts
+.DS_Store
+*.swp

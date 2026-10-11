@@ -1,0 +1,3 @@
+#!/usr/bin/env python3
+from osu_tools.cli import run, main_doctor
+raise SystemExit(run(main_doctor))

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "variant_sources": {
+    "taiko dr": "taiko all",
+    "taiko dt": "taiko all",
+    "taiko hr": "taiko all",
+    "taiko sv": "taiko all",
+    "taiko sx": "taiko all",
+    "taiko xl": "taiko all",
+    "mania farm": "mania all",
+    "mania key": "mania all",
+    "mania ln": "mania all",
+    "mania stamina": "mania all",
+    "mania tech": "mania all"
+  },
+  "root_sources": [
+    "std all", "ctb", "taiko all", "mania all",
+    "ctb converts", "taiko converts", "mania converts"
+  ],
+  "sync_loved": true,
+  "sync_played": true,
+  "convert_into_mode_all": true
+}

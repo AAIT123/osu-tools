@@ -1,61 +1,121 @@
 # osu-tools
 
-A set of small, offline CLI tools for osu!stable running under osu-winello
-on Linux. Built to avoid three things: tosu/memory-reading, browser
-extensions, and Discord bots — everything here reads osu!'s own local files
-directly instead.
+Fast CLI utilities for **osu!stable on Linux/Wine**, designed around a lower-end computer and a personal gameplay/mapping workflow. The goal isn't to reject browsers, Discord bots, overlays or tosu: it's to avoid loading one for a small task when a local command can answer it. Online integrations are useful when local data cannot provide the answer.
 
-Read `ARCHITECTURE.md` before changing anything structural, and
-`LESSONS.md` before trusting a fix that "looks right." Both exist because
-this project has already been burned by shortcuts once each.
+**Project status:** Development version. The shared Python core centralizes collection and score parsing, readable index/snapshots, safety checks and optional public API access. Automated synthetic tests pass; the collection sync and readable snapshot have also been run successfully on an Artix/Wine installation. Native-standard-only convert filtering and authenticated API responses still need validation on additional real libraries. Review dry runs before any write.
 
-## Install
+## Install / upgrade
+
+From an existing clone of the original repo, unpack the overlay over the top (see `INTEGRATION.md`), then:
 
 ```bash
-sudo cp osu /usr/local/bin/osu
-sudo chmod +x /usr/local/bin/osu
-mkdir -p ~/.local/share/osu-tools
-cp osu-current osu-fix-video osu-bpm-offset osu-pp osu-recent osu-collections osu-backup ~/.local/share/osu-tools/
-chmod +x ~/.local/share/osu-tools/*
+bash install.sh
+osu doctor
+osu collections sync               # dry run, never writes
+# Review per-source counts and check for unexpected bulk additions first.
+# Close osu! before applying small, intentional changes:
+osu collections sync --apply       # guarded at 1000 additions / 100 removals
+# Optional: move known wrong-native hashes OUT of native aggregates:
+osu collections sync --prune-mismatches        # inspect removals
+osu collections sync --prune-mismatches --apply # with osu! closed
 ```
 
-`osu` is a git-style dispatcher: `osu <name> [args]` runs
-`~/.local/share/osu-tools/osu-<name>`. Bare `osu` (no args) launches the
-game and auto-starts the map tracker.
+The installer places scripts and `osu_tools/` in `~/.local/share/osu-tools`, and `osu` in `~/.local/bin` without sudo. Set `OSU_TOOLS_DIR`, `OSU_BIN_DIR`, `OSU_SONGS`, `OSU_LAUNCH_CMD` as needed. Python **3.11+** is required for the refactored commands. The original optional requirements remain (`inotify-tools`, `ffmpeg`, `rosu-pp-py`, `librosa`, etc. per command).
 
-Dependencies: `inotify-tools` (pacman), `ffmpeg`, and for the Python tools,
-`pip install --user --break-system-packages rosu-pp-py librosa numpy soundfile`
-(Arch/Artix's system Python is externally managed — see LESSONS.md).
+## Commands
 
-## Tools
+| Command | Description | Source |
+| --- | --- | --- |
+| `osu` | Launch osu! and start last-opened-map tracker | Existing Wine launcher |
+| `osu current` | Last opened `.osu` file (heuristic, not guaranteed live state) | inotify |
+| `osu pp` | Local pp / difficulty calculation | rosu-pp-py |
+| `osu recent` | Last saved replay / pp | local replay files |
+| `osu fix-video` | Video compatibility workaround | ffmpeg |
+| `osu bpm-offset` | Audio timing estimate | librosa |
+| `osu backup` | Verified backups of game data | osu! databases |
+| **`osu library snapshot [--with-replays]`** | Readable JSONL library and local scores, with exact original database copies | local files |
+| `osu library list` | List retained archival snapshots | local files |
+| `osu collections policy-init` / `policy-show` | Manage explicit inclusion rules; no implicit prefix matching | JSON configuration |
+| **`osu collections sync`** | Order-preserving sync with explicit policy rules (dry-run default) | local osu!.db, collection.db, scores.db |
+| `osu collections sync-variants` | Only policy-listed variant propagation (including converts) | local collections |
+| `osu collections sync-modes` | Explicitly classify root `all` entries by the *difficulty's native mode* (potentially many additions) | local osu!.db |
+| `osu collections sync-all` | Mode aggregates (and explicit converts) up to root `all` | local collections |
+| `osu collections sync-loved` | Add locally known Loved difficulties to `all loved` | local osu!.db |
+| `osu collections sync-played` | Add exactly identified saved local-score difficulties to `all played` | local scores.db |
+| `osu collections show NAME` | Show members of matching collection(s) | local DB |
+| **`osu profile [USER] [--mode std]`** | Public pp/rank/profile information | osu! API (opt-in) |
+| **`osu compare [MAP.osu] [--top N]`** | Online beatmap leaderboard and your online score | osu! API (opt-in) |
+| **`osu doctor [--deep]`** | Lightweight path/dependency/config diagnostic | local system |
 
-| Command | What it does | Needs |
-|---|---|---|
-| `osu` | Launches the game; bare invocation also starts the map tracker | — |
-| `osu current [watch\|get\|folder]` | Tracks which exact `.osu` difficulty is currently open, via inotify — no tosu | `inotify-tools` |
-| `osu fix-video [-c\|-a\|-s <pat>\|--force]` | Fixes the osu!stable video-freeze bug (issue #1197) by remuxing to FLV, with a re-encode fallback for codecs FLV can't carry unchanged | `ffmpeg`, `osu-current` running |
-| `osu bpm-offset [--current]` | Beat-detection BPM/offset estimate from the audio file | `librosa` |
-| `osu pp [file] [--mode] [--mods] [--acc]` | Local pp calculator (rosu-pp) for the current or a given map, all 4 modes | `rosu-pp-py` |
-| `osu recent [--list]` | Your last local replay on the current map: real judgements and pp, all 4 modes, reads both `Replays/` and `Data/r` | `rosu-pp-py` |
-| `osu collections [show <name>\|sync-loved\|sync-modes\|sync-variants] [--apply]` | Diagnoses and (with `--apply`) repairs collection.db against rules you define | — |
-| `osu backup [--list\|--with-osudb\|--rebuild-scores]` | Verified, incremental backups of collection.db/scores.db/Data/r | — |
+**Database edits are dry-run by default**, require `--apply`, refuse to write if osu! appears to be running, verify a uniquely named backup and atomically replace the original. A bulk-change guard blocks applies exceeding 1,000 additions or 100 removals unless explicitly approved with `--allow-large` (or thresholds adjusted). `--force` overrides the process check but is **unsafe**. Old tools such as `osu fix-video` have their own safety behavior; these new guarantees refer specifically to the refactored `osu collections` commands.
 
-Everything defaults to **dry-run** where it writes anything at all
-(`osu-collections`, `osu-backup --rebuild-scores`). Nothing touches a real
-file without an explicit `--apply` or `--yes`/an interactive confirmation.
+## Your collection scheme
 
-## Not built yet
+This project originally encoded **one person's collection naming habits**, not a universal osu! hierarchy. osu!stable has *flat collections*, not actual nested folders. The hierarchy below is a logical inclusion policy:
 
-Two tools are blocked on the osu! API (a free OAuth client, not the same
-thing as tosu/a browser extension/a Discord bot — see the end of this
-conversation's history for why that distinction mattered to the person who
-commissioned this):
+```text
+all
+├── std all        ← ONLY explicitly configured std variant sources
+├── taiko all      ← ONLY explicitly configured taiko variant sources
+├── mania all      ← ONLY explicitly configured mania variant sources
+└── ctb            ← ONLY explicitly configured catch variant sources
 
-- `osu-profile` — real rank/pp/stats, can't be derived locally
-- `osu-compare` — a map's real leaderboard
+all loved
+all played
+all new  (reserved; discovery-by-year workflow not yet built)
 
-Also parked, same blocker: an `all new` collection-sync rule that needs to
-resolve bare MD5 hashes back to beatmap identity, which is either an osu!
-API lookup or the original `.osdb` file (from Piotrekol's Collection
-Manager) if it still exists somewhere — `.osdb` carries map IDs directly,
-`.db`/`collection.db` only ever stores hashes.
+# Explicit cross-mode tags (native osu!standard maps ONLY):
+taiko converts       ← standard difficulties played as taiko
+mania converts       ← standard difficulties played as mania
+ctb converts         ← standard difficulties played as catch
+# There is no 'std converts'; native taiko/catch/mania cannot become converts.
+```
+
+Example: a **native standard** difficulty tagged in `taiko converts` remains native standard, but the default sync adds it to **`taiko all` and root `all`** because you explicitly identified it as a taiko convert. A native taiko/catch/mania difficulty in a converts collection is left there as a manual tag but **never propagated through that convert rule**; unknown checksums are also excluded. An obsolete `std converts` entry in an existing policy is ignored with a warning. It does not implicitly add it to `std all`; `--from-root` can perform that reverse native classification explicitly. `--prune-mismatches` protects these intentional convert exceptions while still warning about unrelated non-native members of native aggregates. A standard map in a separately configured `taiko hd` variant is *reported*, never guessed to be a convert. The default never redistributes every root member into mode aggregates, and it never infers rules from a collection name like `std hdhr`. Unknown checksums and manually tagged collections are preserved. This behavior is configurable via `convert_into_mode_all` and `root_sources` in the policy; the program doesn't write osu!'s files unless you explicitly use `--apply` with the game closed.
+
+`all played` uses **saved scores from `scores.db`**, not the API's most-played *beatmapsets* (which cannot identify the exact difficulty played). Failures/quits and scores not saved locally may be absent. `all new` remains reserved: discovery/download-by-year needs a separate design, not a collection checksum rule.
+
+See [COLLECTIONS.md](COLLECTIONS.md) for exact sync semantics.
+
+## Opt-in API setup
+
+The public profile and leaderboard tools use a client-credentials OAuth application: [osu! account settings](https://osu.ppy.sh/home/account/edit), OAuth section. Place credentials in `~/.config/osu-tools/api.conf`:
+
+```ini
+client_id = YOUR_ID
+client_secret = YOUR_SECRET
+```
+
+Then run `chmod 600 ~/.config/osu-tools/api.conf`. Alternatively use environment variables `OSU_API_CLIENT_ID`, `OSU_API_CLIENT_SECRET`. Token caching is on disk with restricted permissions, and API calls happen **only** when an online command is used. No secret belongs in Git.
+
+## Readable library and explicit sync policy
+
+`osu collections sync` no longer guesses variant inheritance from prefixes. `std hdhr` is **not** a sync source unless you opt it in under `variant_sources` in your personal `~/.config/osu-tools/collections.json` policy. Other native-mode aggregates can still flow to root `all`, with mode checks. Create/review the default policy using:
+
+```bash
+osu collections policy-init
+osu collections policy-show
+osu collections sync --timings      # dry-run; review source breakdown
+```
+
+The active read-only index is now human-readable JSON/JSONL under `~/.local/share/osu-tools/library-index/`. It stores **beatmap metadata and saved local score details** and is reused as a cache on later runs; archival snapshots also include readable CSV views. On demand, and with osu! **closed**, archive these readable files along with byte-exact originals that can be restored:
+
+```bash
+osu library snapshot               # original .db files + readable exports
+osu library snapshot --with-replays # additionally back up Data/r/*.osr
+osu library list
+```
+
+Read [COLLECTIONS.md](COLLECTIONS.md) for the exact personal policy and convert behavior, and [LIBRARY.md](LIBRARY.md) for export, cache invalidation and restore limitations. The original binary files are essential for exact recovery; JSON exports alone aren't reversible into all osu!stable database fields.
+
+## Optimization direction
+
+The refactor centralizes DB readers, config paths, safe writes, collection rules and API transport in the tiny standard-library `osu_tools/` package. The original pp, recent, video, backup, current tracker and BPM scripts remain separate and unchanged in this overlay, avoiding untested rewrites. Follow-up work should migrate their duplicated readers and checks incrementally **with tests**. More features are outlined in [ROADMAP.md](ROADMAP.md); measuring cold-start, large-library memory and actual runtime is more useful than guessing optimizations.
+
+## Tests and feedback
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests generate synthetic `.db` files; they do **not** use your files or credentials. See [CORE.md](CORE.md) and [INTEGRATION.md](INTEGRATION.md). When filing an issue, remove usernames, private scores, token files, and other sensitive information before sharing logs.

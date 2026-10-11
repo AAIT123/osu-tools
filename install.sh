@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# Installs osu-tools: the 'osu' dispatcher onto PATH, everything else into
-# ~/.local/share/osu-tools/. Safe to re-run to pick up updates.
+# Install over a normal clone of AAIT123/osu-tools, no sudo by default.
 set -euo pipefail
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS_DIR="${OSU_TOOLS_DIR:-$HOME/.local/share/osu-tools}"
-BIN_DIR="/usr/local/bin"
-
-mkdir -p "$TOOLS_DIR"
-for f in osu-current osu-fix-video osu-bpm-offset osu-pp osu-recent osu-collections osu-backup; do
-    cp "$HERE/$f" "$TOOLS_DIR/$f"
-    chmod +x "$TOOLS_DIR/$f"
-done
-echo "Installed to $TOOLS_DIR"
-
-if [ -w "$BIN_DIR" ]; then
-    cp "$HERE/osu" "$BIN_DIR/osu"
-else
-    sudo cp "$HERE/osu" "$BIN_DIR/osu"
+BIN_DIR="${OSU_BIN_DIR:-$HOME/.local/bin}"
+if [[ ! -f "$HERE/osu" ]]; then
+  echo 'This is a refactor OVERLAY. Unpack into a clone of AAIT123/osu-tools first.' >&2
+  exit 1
 fi
-chmod +x "$BIN_DIR/osu" 2>/dev/null || sudo chmod +x "$BIN_DIR/osu"
-echo "Installed $BIN_DIR/osu"
-
-echo
-echo "Done. Run 'osu' to launch the game (and start the map tracker), or"
-echo "'osu current watch &' to start tracking without launching the game."
+mkdir -p "$TOOLS_DIR" "$BIN_DIR"
+# Existing helper entrypoints (backup, current, pp, recent...) remain available.
+for source in "$HERE"/osu-*; do
+  [[ -f "$source" ]] || continue
+  cp -- "$source" "$TOOLS_DIR/$(basename "$source")"
+  chmod +x "$TOOLS_DIR/$(basename "$source")"
+done
+cp -R -- "$HERE/osu_tools" "$TOOLS_DIR/"
+# Don't copy __pycache__ from source if present.
+find "$TOOLS_DIR/osu_tools" -type d -name __pycache__ -prune -exec rm -rf {} +
+cp -- "$HERE/osu" "$BIN_DIR/osu"
+chmod +x "$BIN_DIR/osu"
+echo "Installed commands to $TOOLS_DIR and launcher to $BIN_DIR/osu"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) : ;;
+  *) echo "Add $BIN_DIR to your PATH to use 'osu' from the shell." ;;
+esac
+echo "Try: osu doctor; osu collections sync; osu collections sync --apply (with game closed)"

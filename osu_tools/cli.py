@@ -354,7 +354,7 @@ def main_scores(argv=None):
                          best_saved_per_difficulty, summarize_saved_scores)
     parser = argparse.ArgumentParser(description='Offline osu!stable saved scores (scores.db)')
     parser.add_argument('command', nargs='?', default='recent',
-                        choices=['recent', 'best', 'map', 'search', 'pbs', 'summary'])
+                        choices=['recent', 'best', 'map', 'search', 'pbs', 'summary', 'pp'])
     parser.add_argument('value', nargs='?',
                         help='Map path/checksum (map), or artist/title/difficulty (search, optional for pbs)')
     parser.add_argument('--limit', type=int, default=20, help='Maximum score rows (1-100)')
@@ -377,7 +377,7 @@ def main_scores(argv=None):
     # Resolve titles from the verified beatmap index. A score is identified by
     # its played ruleset, independently of the map's native mode.
     _, _, maps = cached_beatmaps(maps_path)
-    if args.command in {'search', 'pbs'} and args.value:
+    if args.command in {'search', 'pbs', 'pp'} and args.value:
         eligible = match_maps(args.value, maps)
 
     if args.command == 'summary':
@@ -401,6 +401,32 @@ def main_scores(argv=None):
                   f'({item["most_played_count"]} saved plays)')
         if not result['saved_scores']:
             print('No matching saved scores in scores.db.')
+        return 0
+
+    if args.command == 'pp':
+        if args.limit > 20:
+            parser.error('pp estimation is limited to 20 saved plays per run')
+        from .local_pp import local_estimates, _rosu_engine
+        rosu = _rosu_engine()  # fail helpfully if optional dependency is missing
+        count, rows = find_scores(scores_path, limit=args.limit, order='recent',
+                                  mode=mode, player=args.player, eligible=eligible)
+        enriched = local_estimates(rows, maps, rosu=rosu)
+        if args.json:
+            print(json.dumps({'matching_count': count, 'method': 'estimated_legacy_pp',
+                              'scores': enriched}, ensure_ascii=False, indent=2))
+            return 0
+        print(f'{count:,} locally saved score(s) match; estimating most recent '
+              f'{len(enriched)} (not official online pp)')
+        for row in enriched:
+            if row['estimated_pp'] is not None:
+                summary = f'~{row["estimated_pp"]:.2f} pp'
+                if row['estimated_stars'] is not None:
+                    summary += f' | {row["estimated_stars"]:.2f} stars'
+            else:
+                summary = f'skipped: {row["pp_skipped"]}'
+            print(f'{row["mode_name"]} | {row["mods"]} | {summary} | '
+                  f'{row["date_utc"] or "unknown date"}')
+            print('  ' + row['map_label'])
         return 0
 
     if args.command == 'pbs':

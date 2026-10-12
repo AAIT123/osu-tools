@@ -30,7 +30,7 @@ The installer places scripts and `osu_tools/` in `~/.local/share/osu-tools`, and
 | `osu current` | Last opened `.osu` file (heuristic, not guaranteed live state) | inotify |
 | `osu pp` | Local pp / difficulty calculation | rosu-pp-py |
 | `osu recent` | Last saved replay / pp | local replay files |
-| **`osu scores [recent|best|map|search]`** | Offline saved-score lookup, per-mode accuracy and JSON output | local `scores.db` + readable cache |
+| **`osu scores [recent|best|map|search|pbs|summary|pp]`** | Offline saved-score lookup, per-mode accuracy and JSON output | local `scores.db` + readable cache |
 | `osu fix-video` | Video compatibility workaround | ffmpeg |
 | `osu bpm-offset` | Audio timing estimate | librosa |
 | `osu backup` | Verified backups of game data | osu! databases |
@@ -155,3 +155,11 @@ for per-ruleset counts and most-played difficulties, or
 `osu scores pbs [TITLE] [--mode MODE]` for the highest **raw locally saved**
 score per player, exact difficulty checksum, played mode and mod combination.
 These are not online PBs or pp rankings; see [SCORES.md](SCORES.md).
+
+### Experimental saved-score pp estimates
+
+`osu scores pp --mode taiko --limit 5` calculates approximate *legacy* pp for
+recent saved plays with available, checksum-matched `.osu` files. This is
+read-only and on-demand (never part of prelaunch), not official pp or a global
+pp-sorted leaderboard. Supports standard maps played as converts; other native
+modes cannot convert. See [SCORES.md](SCORES.md).

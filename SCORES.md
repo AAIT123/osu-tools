@@ -87,3 +87,33 @@ These commands never edit `scores.db`, collections, replays, or cached index
 format. The first run may rebuild an outdated index; subsequent runs verify
 and reuse it. Local JSON output contains personal play history, so keep it
 private if appropriate.
+
+## On-demand estimated legacy pp
+
+**Experimental, read-only:** `osu scores pp` calculates *estimated* pp for up
+to 20 **recent locally saved plays** per invocation, using their recorded hit
+counts, combo, mods, played ruleset, and a checksum-verified installed `.osu`
+file. This is **not a ranking by pp**: it selects recent saved plays and
+calculates estimates for those. Unlike `osu scores pbs` and `best`, it uses
+`rosu-pp-py` and may take noticeable time to read/calculate each map.
+
+```sh
+osu scores pp --mode taiko --limit 5
+osu scores pp 'Kobaryo' --limit 10
+osu scores pp --mode mania --json
+```
+
+The map lookup is limited to the installed difficulty's **known folder** from
+`osu!.db`. Files are MD5-verified before calculation; missing, modified, oversized,
+or unavailable files are reported as skipped. A native standard beatmap can be
+converted to taiko/catch/mania if the recorded play is in that mode; **no
+other native mode can convert**. Unsupported assist/practice mods and saved
+scores with no recorded hit counts are also skipped, never guessed.
+
+The command supports both modern `rosu-pp-py` `Performance` and older
+`Calculator` interfaces. For modern engines it explicitly uses **legacy**
+(`lazer=False`) settings. Its estimates may differ from pp awarded at the
+original play date, from online scores, or between pp algorithm releases.
+It never edits scores, replays, beatmaps, collection databases, or the readable
+index itself. The index may be transparently rebuilt if stale, as with other
+`osu scores` commands. **No background calculation** runs when launching osu!.

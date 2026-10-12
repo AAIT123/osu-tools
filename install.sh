@@ -42,6 +42,16 @@ if [ "${1:-}" = "scores" ]; then
   printf 'osu-tools: osu-scores is missing; reinstall osu-tools\n' >&2
   exit 1
 fi
+# Offline beatmap search uses the existing readable osu!.db index.
+if [ "${1:-}" = "search" ]; then
+  _osu_search="${OSU_TOOLS_DIR:-$HOME/.local/share/osu-tools}/osu-search"
+  if [ -x "$_osu_search" ]; then
+    shift
+    exec "$_osu_search" "$@"
+  fi
+  printf 'osu-tools: osu-search is missing; reinstall osu-tools\n' >&2
+  exit 1
+fi
 # --- osu-tools optional prelaunch hook ---
 if [ "$#" -eq 0 ] && [ "${OSU_TOOLS_SKIP_PRELAUNCH:-0}" != "1" ]; then
   _osu_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/osu-tools/prelaunch.json"

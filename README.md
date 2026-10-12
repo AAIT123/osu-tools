@@ -30,6 +30,7 @@ The installer places scripts and `osu_tools/` in `~/.local/share/osu-tools`, and
 | `osu current` | Last opened `.osu` file (heuristic, not guaranteed live state) | inotify |
 | `osu pp` | Local pp / difficulty calculation | rosu-pp-py |
 | `osu recent` | Last saved replay / pp | local replay files |
+| **`osu search QUERY [--mode MODE] [--collection NAME]`** | Offline installed difficulty search, exact collection filter and JSON output | readable `osu!.db` index |
 | **`osu scores [recent|best|map|search|pbs|summary|pp]`** | Offline saved-score lookup, per-mode accuracy and JSON output | local `scores.db` + readable cache |
 | `osu fix-video` | Video compatibility workaround | ffmpeg |
 | `osu bpm-offset` | Audio timing estimate | librosa |
@@ -143,6 +144,15 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests generate synthetic `.db` files; they do **not** use your files or credentials. See [CORE.md](CORE.md) and [INTEGRATION.md](INTEGRATION.md). When filing an issue, remove usernames, private scores, token files, and other sensitive information before sharing logs.
+
+## Offline installed beatmap search
+
+`osu search 'Kobaryo' --mode taiko` lists installed **native taiko**
+difficulties, while `osu search --collection 'mania converts' --mode std`
+finds **native standard** difficulties manually tagged as mania converts.
+`osu search --loved`, `--beatmap-id`, `--set-id`, and `--json` are also
+available. Unlike `osu scores search`, the search includes beatmaps with no
+saved scores. All operations are offline and read-only; see [SEARCH.md](SEARCH.md).
 
 ## Saved local score browsing
 

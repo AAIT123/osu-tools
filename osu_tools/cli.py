@@ -461,6 +461,78 @@ def main_scores(argv=None):
     return 0
 
 
+def main_search(argv=None):
+    """Search installed difficulty metadata; optionally restrict to one collection."""
+    import json
+    from .search import MODE_IDS, search_beatmaps, as_record
+    parser = argparse.ArgumentParser(description='Search installed osu!stable beatmaps offline')
+    parser.add_argument('query', nargs='*', help='Artist, title, or difficulty (case-insensitive words)')
+    parser.add_argument('--mode', choices=sorted(MODE_IDS),
+                        help='Native difficulty mode, NOT the mode used to play converts')
+    parser.add_argument('--collection', help='Filter by exact collection name; existing manual tags only')
+    parser.add_argument('--loved', action='store_true', help='Only locally identified Loved difficulties')
+    parser.add_argument('--beatmap-id', type=int, help='Exact difficulty ID from osu!.db')
+    parser.add_argument('--set-id', type=int, help='Exact beatmapset ID from osu!.db')
+    parser.add_argument('--limit', type=int, default=20, help='Show 1–100 results (default 20)')
+    parser.add_argument('--json', action='store_true', help='Machine-readable output')
+    parser.add_argument('--timings', action='store_true', help='Show load and search time (stderr)')
+    args = parser.parse_args(argv)
+    if not 1 <= args.limit <= 100:
+        parser.error('--limit must be between 1 and 100')
+    if args.beatmap_id is not None and args.beatmap_id <= 0:
+        parser.error('--beatmap-id must be positive')
+    if args.set_id is not None and args.set_id <= 0:
+        parser.error('--set-id must be positive')
+    query = ' '.join(args.query).strip()
+    if not (query or args.collection or args.loved or args.mode or
+            args.beatmap_id is not None or args.set_id is not None):
+        parser.error('Supply a search query or at least one filter')
+    if len(query) > 512 or len(query.split()) > 16:
+        parser.error('Search query is too long (512 characters / 16 words maximum)')
+    t0 = time.perf_counter()
+    hashes = None
+    unresolved = 0
+    if args.collection is not None:
+        db = load_collections(paths.osu_root()/'collection.db')
+        collections = [c for c in db.collections if c.name.casefold() == args.collection.casefold()]
+        if not collections:
+            raise ValueError(f'No collection named exactly: {args.collection!r}')
+        if len(collections) > 1:
+            raise ValueError(f'Ambiguous collection name: {args.collection!r}')
+        hashes = {h.lower() for h in collections[0].hashes}
+    _, _, maps = cached_beatmaps(paths.osu_root()/'osu!.db')
+    t_loaded = time.perf_counter()
+    if hashes is not None:
+        unresolved = sum(h not in maps for h in hashes)
+    total, found = search_beatmaps(maps, query, native_mode=MODE_IDS.get(args.mode),
+                                   loved=args.loved, collection_hashes=hashes,
+                                   beatmap_id=args.beatmap_id, beatmapset_id=args.set_id,
+                                   limit=args.limit)
+    t_searched = time.perf_counter()
+    if args.json:
+        print(json.dumps({'matching_count': total, 'returned_count': len(found),
+                          'collection_unresolved': unresolved,
+                          'native_mode_filter': args.mode,
+                          'beatmaps': [as_record(b) for b in found]},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(f'{total:,} installed difficulty match(es); showing {len(found)} '
+              f'(native mode filter, not played convert mode)')
+        if hashes is not None and unresolved:
+            print(f'NOTE: {unresolved} unresolved collection checksum(s) were not searched.')
+        for map_ in found:
+            mode = as_record(map_)['native_mode_name']
+            loved = ' | Loved' if map_.ranked_status == 7 else ''
+            print(f'{map_.label} | {mode} | id {map_.beatmap_id} | '
+                  f'set {map_.beatmapset_id}{loved}')
+        if not total:
+            print('No installed difficulties matched the specified filters.')
+    if args.timings:
+        print(f'Timings: load {t_loaded-t0:.3f}s, search {t_searched-t_loaded:.3f}s, '
+              f'total {t_searched-t0:.3f}s', file=sys.stderr)
+    return 0
+
+
 def main_doctor(argv=None):
     import importlib.util
     import shutil

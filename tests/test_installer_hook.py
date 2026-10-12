@@ -19,6 +19,8 @@ class InstallerHookTests(unittest.TestCase):
                                                'printf "%s\\n" "$*" >> "$OSU_TEST_HOOK_LOG"\n')
             (repo/'osu-scores').write_text('#!/usr/bin/env bash\n'
                                             'printf "SCORE:%s\\n" "$*"\n')
+            (repo/'osu-search').write_text('#!/usr/bin/env bash\n'
+                                            'printf "SEARCH:%s\\n" "$*"\n')
             (repo/'osu_tools').mkdir()
             (repo/'osu_tools'/'__init__.py').write_text('')
             config = root/'config'/'osu-tools'
@@ -36,6 +38,8 @@ class InstallerHookTests(unittest.TestCase):
             self.assertEqual(launch('doctor'), 'ARG:doctor')
             self.assertEqual(launch('scores', 'recent', '--limit', '5'),
                              'SCORE:recent --limit 5')
+            self.assertEqual(launch('search', 'Kobaryo', '--mode', 'taiko'),
+                             'SEARCH:Kobaryo --mode taiko')
             self.assertFalse((root/'calls').exists())
             self.assertEqual(launch(), 'GAME')
             self.assertEqual((root/'calls').read_text().strip(), 'run --quiet')

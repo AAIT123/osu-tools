@@ -348,12 +348,15 @@ def main_compare(argv=None):
 
 
 def main_scores(argv=None):
-    """Browse actual locally saved scores without opening the game or API."""
+    """Browse saved local scores and compute offline summaries."""
     import json
-    from .scores import MODE_IDS, enrich, find_scores, map_checksum, match_maps
+    from .scores import (MODE_IDS, enrich, find_scores, map_checksum, match_maps,
+                         best_saved_per_difficulty, summarize_saved_scores)
     parser = argparse.ArgumentParser(description='Offline osu!stable saved scores (scores.db)')
-    parser.add_argument('command', nargs='?', default='recent', choices=['recent', 'best', 'map', 'search'])
-    parser.add_argument('value', nargs='?', help='Map path/checksum (map), or artist/title/difficulty (search)')
+    parser.add_argument('command', nargs='?', default='recent',
+                        choices=['recent', 'best', 'map', 'search', 'pbs', 'summary'])
+    parser.add_argument('value', nargs='?',
+                        help='Map path/checksum (map), or artist/title/difficulty (search, optional for pbs)')
     parser.add_argument('--limit', type=int, default=20, help='Maximum score rows (1-100)')
     parser.add_argument('--mode', choices=sorted(MODE_IDS), help='Played ruleset (including converts)')
     parser.add_argument('--player', help='Filter exactly by player name, case-insensitive')
@@ -361,30 +364,66 @@ def main_scores(argv=None):
     args = parser.parse_args(argv)
     if not 1 <= args.limit <= 100:
         parser.error('--limit must be between 1 and 100')
-    if args.command in {'recent', 'best'} and args.value:
+    if args.command in {'recent', 'best', 'summary'} and args.value:
         parser.error(f'{args.command} does not take a positional value')
     if args.command == 'search' and not args.value:
         parser.error('search requires part of a beatmap title, artist, or difficulty')
     maps_path = paths.osu_root() / 'osu!.db'
     scores_path = paths.osu_root() / 'scores.db'
+    mode = MODE_IDS.get(args.mode) if args.mode else None
     eligible = None
     if args.command == 'map':
         eligible = {map_checksum(args.value or ':current')}
-    # Map titles and mode information are always resolved from the existing
-    # readable library cache. No new service or network request is involved.
+    # Resolve titles from the verified beatmap index. A score is identified by
+    # its played ruleset, independently of the map's native mode.
     _, _, maps = cached_beatmaps(maps_path)
-    if args.command == 'search':
+    if args.command in {'search', 'pbs'} and args.value:
         eligible = match_maps(args.value, maps)
-    order = 'best' if args.command == 'best' else 'recent'
-    count, rows = find_scores(scores_path, limit=args.limit, order=order,
-                              mode=MODE_IDS.get(args.mode) if args.mode else None,
-                              player=args.player, eligible=eligible)
-    enriched = [enrich(row, maps) for row in rows]
-    if args.json:
-        print(json.dumps({'matching_count': count, 'scores': enriched},
-                         ensure_ascii=False, indent=2))
+
+    if args.command == 'summary':
+        result = summarize_saved_scores(scores_path, mode=mode, player=args.player)
+        for item in result['modes']:
+            bm = maps.get(item['most_played_map_md5'])
+            item['most_played_map_label'] = (bm.label if bm else
+                f'Unknown / uninstalled map ({item["most_played_map_md5"]})')
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        print(f'{result["saved_scores"]:,} saved local score(s) across '
+              f'{result["unique_difficulties"]:,} unique difficulty checksum(s)')
+        for item in result['modes']:
+            acc = (f'{item["mean_accuracy_percent"]:.2f}%'
+                   if item['mean_accuracy_percent'] is not None else 'unavailable')
+            print(f'{item["mode_name"]}: {item["plays"]:,} plays | '
+                  f'{item["unique_difficulties"]:,} difficulties | '
+                  f'mean saved accuracy {acc} | latest {item["latest_utc"] or "unknown"}')
+            print(f'  Most played: {item["most_played_map_label"]} '
+                  f'({item["most_played_count"]} saved plays)')
+        if not result['saved_scores']:
+            print('No matching saved scores in scores.db.')
         return 0
-    print(f'{count:,} saved local score(s) match; showing {len(rows)} {order} (not pp-ranked)')
+
+    if args.command == 'pbs':
+        count, groups, rows = best_saved_per_difficulty(
+            scores_path, limit=args.limit, mode=mode, player=args.player, eligible=eligible)
+        enriched = [enrich(row, maps) for row in rows]
+        if args.json:
+            print(json.dumps({'matching_count': count, 'unique_groups': groups,
+                              'grouping': 'player+diff_md5+played_mode+mods_bitmask',
+                              'scores': enriched}, ensure_ascii=False, indent=2))
+            return 0
+        print(f'{count:,} saved play(s) across {groups:,} player/difficulty/mode/mod group(s); '
+              f'showing {len(enriched)} best saved raw scores (not pp)')
+    else:
+        order = 'best' if args.command == 'best' else 'recent'
+        count, rows = find_scores(scores_path, limit=args.limit, order=order,
+                                  mode=mode, player=args.player, eligible=eligible)
+        enriched = [enrich(row, maps) for row in rows]
+        if args.json:
+            print(json.dumps({'matching_count': count, 'scores': enriched},
+                             ensure_ascii=False, indent=2))
+            return 0
+        print(f'{count:,} saved local score(s) match; showing {len(rows)} {order} (not pp-ranked)')
     for row in enriched:
         acc = f'{row["accuracy_percent"]:.2f}%' if row['accuracy_percent'] is not None else '? acc'
         print(f'{row["date_utc"] or "unknown date"} | {row["mode_name"]} | '

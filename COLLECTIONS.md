@@ -74,3 +74,18 @@ You can use `--policy /path/to/collections.json` for testing alternative rules w
 ### Legacy policy migration
 
 The previous generated `~/.config/osu-tools/collections.json` included `"std converts"` under `root_sources`. You do **not** need to recreate your configuration: the reader accepts that old entry but ignores it, reporting a warning. Remove that single string manually when convenient. New policies and `collections.policy.example.json` no longer include it. Do not add `std converts` as a `variant_sources` destination.
+
+
+## Editing explicit variant rules from the CLI
+
+```bash
+osu collections policy-add 'mania ln' 'mania all'
+osu collections policy-add 'taiko dr' 'taiko all'
+osu collections policy-remove 'mania ln'
+osu collections policy-show
+```
+
+Rules match **exact collection names**, never prefixes. The commands update
+only your private `~/.config/osu-tools/collections.json` atomically; they do not
+write to `collection.db`. Preview a sync before enabling automatic applies.
+For opt-in pre-launch checks, see [PRELAUNCH.md](PRELAUNCH.md).

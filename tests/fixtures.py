@@ -62,12 +62,18 @@ def make_scores(path: Path, entries):
     w=W(); w.int(VERSION); w.int(len(entries))
     for hash_,scores in entries:
         w.string(hash_); w.int(len(scores))
-        for mode, mods in scores:
+        for item in scores:
+            # Optional raw score and timestamp allow ranking tests without
+            # making production code rely on fabricated source records.
+            mode, mods = item[:2]
+            raw_score = item[2] if len(item) > 2 else 7777
+            ticks = item[3] if len(item) > 3 else 0
             w.byte(mode); w.int(VERSION)
-            for s in (hash_, 'Test User', 'replaymd5'): w.string(s)
+            player = item[4] if len(item) > 4 else 'Test User'
+            for s in (hash_, player, 'replaymd5'): w.string(s)
             for _ in range(6): w.short(0)
-            w.int(7777); w.short(55); w.byte(1)
+            w.int(raw_score); w.short(55); w.byte(1)
             w.int(mods); w.string('')
-            w.long(0); w.int(-1); w.long(0)
+            w.long(ticks); w.int(-1); w.long(0)
             if mods & 8388608: w.double(0.0)
     path.write_bytes(w.bytes())

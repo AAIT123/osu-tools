@@ -147,3 +147,11 @@ Tests generate synthetic `.db` files; they do **not** use your files or credenti
 ## Saved local score browsing
 
 `osu scores` shows the latest saved local plays, `osu scores best` ranks by **raw score** (not pp), `osu scores map :current` filters the last tracked difficulty, and `osu scores search 'artist or title'` finds saved scores for installed maps. The `--mode` filter uses the played ruleset (including standard converts), and `--json` produces machine-readable results. See [SCORES.md](SCORES.md).
+
+### Offline saved-score insights
+
+In addition to individual saved plays, use `osu scores summary [--mode MODE]`
+for per-ruleset counts and most-played difficulties, or
+`osu scores pbs [TITLE] [--mode MODE]` for the highest **raw locally saved**
+score per player, exact difficulty checksum, played mode and mod combination.
+These are not online PBs or pp rankings; see [SCORES.md](SCORES.md).
